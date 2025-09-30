@@ -18,11 +18,15 @@ package auth_test
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -31,6 +35,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gorilla/mux"
 	"github.com/kubernetes-sigs/headlamp/backend/pkg/auth"
 	"github.com/kubernetes-sigs/headlamp/backend/pkg/cache"
 	"github.com/kubernetes-sigs/headlamp/backend/pkg/kubeconfig"
@@ -851,4 +856,236 @@ func TestConfigureTLSContext_CACert(t *testing.T) {
 	caCertParsed, err := x509.ParseCertificate(block.Bytes)
 	require.NoError(t, err)
 	assert.True(t, caCertParsed.IsCA, "Generated certificate should be a CA certificate")
+}
+
+var testTokenSigningKey = []byte("headlamp-test-signing-key")
+
+func makeTestToken(t *testing.T, claims map[string]interface{}) string {
+	t.Helper()
+
+	header := map[string]interface{}{
+		"alg": "HS256",
+		"typ": "JWT",
+	}
+
+	headerJSON, err := json.Marshal(header)
+	require.NoError(t, err)
+
+	payloadJSON, err := json.Marshal(claims)
+	require.NoError(t, err)
+
+	unsigned := fmt.Sprintf("%s.%s",
+		base64.RawURLEncoding.EncodeToString(headerJSON),
+		base64.RawURLEncoding.EncodeToString(payloadJSON),
+	)
+
+	mac := hmac.New(sha256.New, testTokenSigningKey)
+	_, err = mac.Write([]byte(unsigned))
+	require.NoError(t, err)
+
+	signature := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+
+	return unsigned + "." + signature
+}
+
+func verifyTestTokenSignature(token string, key []byte) bool {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return false
+	}
+
+	unsigned := parts[0] + "." + parts[1]
+
+	mac := hmac.New(sha256.New, key)
+	mac.Write([]byte(unsigned))
+	expected := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+
+	if subtle.ConstantTimeCompare([]byte(expected), []byte(parts[2])) != 1 {
+		return false
+	}
+
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return false
+	}
+
+	var claims map[string]interface{}
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return false
+	}
+
+	return true
+}
+
+func TestHandleMe_Success(t *testing.T) {
+	t.Parallel()
+
+	expiry := time.Now().Add(time.Hour).Unix()
+	claims := map[string]interface{}{
+		"preferred_username": "alice",
+		"email":              "alice@example.com",
+		"groups":             []string{"dev", "ops"},
+		"exp":                float64(expiry),
+	}
+
+	token := makeTestToken(t, claims)
+
+	req := httptest.NewRequest(http.MethodGet, "/clusters/test/me", nil)
+	req = mux.SetURLVars(req, map[string]string{"clusterName": "test"})
+	req.AddCookie(&http.Cookie{
+		Name:  fmt.Sprintf("headlamp-auth-%s.0", auth.SanitizeClusterName("test")),
+		Value: token,
+	})
+
+	rr := httptest.NewRecorder()
+
+	handler := auth.HandleMe(auth.MeHandlerOptions{
+		UsernamePaths: "preferred_username",
+		EmailPaths:    "email",
+		GroupsPaths:   "groups",
+		VerifyToken: func(ctx context.Context, r *http.Request, clusterName, providedToken string) (int, error) {
+			if !verifyTestTokenSignature(providedToken, testTokenSigningKey) {
+				return http.StatusUnauthorized, fmt.Errorf("invalid token signature")
+			}
+			return 0, nil
+		},
+	})
+
+	handler(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	var got struct {
+		Username string   `json:"username"`
+		Email    string   `json:"email"`
+		Groups   []string `json:"groups"`
+	}
+
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &got))
+
+	assert.Equal(t, "alice", got.Username)
+	assert.Equal(t, "alice@example.com", got.Email)
+	assert.Equal(t, []string{"dev", "ops"}, got.Groups)
+	assert.Equal(t, "application/json", rr.Header().Get("Content-Type"))
+	assert.Equal(t, "no-store, no-cache, must-revalidate, private", rr.Header().Get("Cache-Control"))
+	assert.Equal(t, "Cookie", rr.Header().Get("Vary"))
+}
+
+func TestHandleMe_ExpiredToken(t *testing.T) {
+	t.Parallel()
+
+	expiry := time.Now().Add(-time.Hour).Unix()
+	claims := map[string]interface{}{
+		"preferred_username": "alice",
+		"email":              "alice@example.com",
+		"groups":             []string{"dev", "ops"},
+		"exp":                float64(expiry),
+	}
+
+	token := makeTestToken(t, claims)
+
+	req := httptest.NewRequest(http.MethodGet, "/clusters/test/me", nil)
+	req = mux.SetURLVars(req, map[string]string{"clusterName": "test"})
+	req.AddCookie(&http.Cookie{
+		Name:  fmt.Sprintf("headlamp-auth-%s.0", auth.SanitizeClusterName("test")),
+		Value: token,
+	})
+
+	rr := httptest.NewRecorder()
+
+	handler := auth.HandleMe(auth.MeHandlerOptions{
+		UsernamePaths: "preferred_username",
+		EmailPaths:    "email",
+		GroupsPaths:   "groups",
+		VerifyToken: func(ctx context.Context, r *http.Request, clusterName, providedToken string) (int, error) {
+			if !verifyTestTokenSignature(providedToken, testTokenSigningKey) {
+				return http.StatusUnauthorized, fmt.Errorf("invalid token signature")
+			}
+			return 0, nil
+		},
+	})
+
+	handler(rr, req)
+
+	require.Equal(t, http.StatusUnauthorized, rr.Code)
+
+	var got struct {
+		Message string `json:"message"`
+	}
+
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &got))
+	assert.Equal(t, "token expired", got.Message)
+	assert.Equal(t, "application/json", rr.Header().Get("Content-Type"))
+	assert.Equal(t, "no-store, no-cache, must-revalidate, private", rr.Header().Get("Cache-Control"))
+	assert.Equal(t, "Cookie", rr.Header().Get("Vary"))
+}
+
+func TestHandleMe_MissingCookie(t *testing.T) {
+	t.Parallel()
+
+	req := httptest.NewRequest(http.MethodGet, "/clusters/test/me", nil)
+	req = mux.SetURLVars(req, map[string]string{"clusterName": "test"})
+
+	rr := httptest.NewRecorder()
+
+	handler := auth.HandleMe(auth.MeHandlerOptions{})
+
+	handler(rr, req)
+
+	require.Equal(t, http.StatusUnauthorized, rr.Code)
+
+	var got struct {
+		Message string `json:"message"`
+	}
+
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &got))
+	assert.Equal(t, "unauthorized", got.Message)
+	assert.Equal(t, "application/json", rr.Header().Get("Content-Type"))
+	assert.Equal(t, "no-store, no-cache, must-revalidate, private", rr.Header().Get("Cache-Control"))
+	assert.Equal(t, "Cookie", rr.Header().Get("Vary"))
+}
+
+func TestHandleMe_VerifyTokenFailure(t *testing.T) {
+	t.Parallel()
+
+	expiry := time.Now().Add(time.Hour).Unix()
+	claims := map[string]interface{}{
+		"preferred_username": "alice",
+		"email":              "alice@example.com",
+		"exp":                float64(expiry),
+	}
+
+	token := makeTestToken(t, claims)
+
+	req := httptest.NewRequest(http.MethodGet, "/clusters/test/me", nil)
+	req = mux.SetURLVars(req, map[string]string{"clusterName": "test"})
+	req.AddCookie(&http.Cookie{
+		Name:  fmt.Sprintf("headlamp-auth-%s.0", auth.SanitizeClusterName("test")),
+		Value: token,
+	})
+
+	rr := httptest.NewRecorder()
+
+	handler := auth.HandleMe(auth.MeHandlerOptions{
+		VerifyToken: func(ctx context.Context, r *http.Request, clusterName, providedToken string) (int, error) {
+			if !verifyTestTokenSignature(providedToken, []byte("wrong-signing-key")) {
+				return http.StatusUnauthorized, fmt.Errorf("invalid token signature")
+			}
+			return 0, nil
+		},
+	})
+
+	handler(rr, req)
+
+	require.Equal(t, http.StatusUnauthorized, rr.Code)
+
+	var got struct {
+		Message string `json:"message"`
+	}
+
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &got))
+	assert.Equal(t, "invalid token signature", got.Message)
+	assert.Equal(t, "application/json", rr.Header().Get("Content-Type"))
+	assert.Equal(t, "no-store, no-cache, must-revalidate, private", rr.Header().Get("Cache-Control"))
+	assert.Equal(t, "Cookie", rr.Header().Get("Vary"))
 }

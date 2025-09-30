@@ -19,6 +19,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
@@ -36,6 +38,8 @@ import (
 	"testing"
 	"time"
 
+	oidc "github.com/coreos/go-oidc/v3/oidc"
+	jose "github.com/go-jose/go-jose/v4"
 	"github.com/google/uuid"
 	"github.com/gorilla/mux"
 	"github.com/kubernetes-sigs/headlamp/backend/pkg/cache"
@@ -1678,4 +1682,310 @@ func TestHandleClusterServiceProxy(t *testing.T) {
 		assert.Equal(t, http.StatusOK, rr.Code)
 		assert.Equal(t, "OK", rr.Body.String())
 	}
+}
+
+type oidcTestServer struct {
+	issuer    string
+	keyID     string
+	privKey   *rsa.PrivateKey
+	transport http.RoundTripper
+}
+
+type staticResponseTransport struct {
+	responses map[string][]byte
+}
+
+func (s *staticResponseTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	body, ok := s.responses[req.URL.String()]
+	if !ok {
+		return nil, fmt.Errorf("unexpected request to %s", req.URL.String())
+	}
+
+	resp := &http.Response{
+		StatusCode:    http.StatusOK,
+		Header:        make(http.Header),
+		Body:          io.NopCloser(bytes.NewReader(body)),
+		ContentLength: int64(len(body)),
+		Request:       req,
+	}
+	resp.Header.Set("Content-Type", "application/json")
+
+	return resp, nil
+}
+
+func newOIDCTestServer(t *testing.T) *oidcTestServer {
+	t.Helper()
+
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+
+	keyID := uuid.NewString()
+	issuer := fmt.Sprintf("https://issuer.example.test/%s", keyID)
+	jwksURL := issuer + "/keys"
+
+	discoveryBody, err := json.Marshal(map[string]interface{}{
+		"issuer":                                issuer,
+		"jwks_uri":                              jwksURL,
+		"id_token_signing_alg_values_supported": []string{"RS256"},
+	})
+	require.NoError(t, err)
+
+	jwk := jose.JSONWebKey{
+		Key:       &privateKey.PublicKey,
+		KeyID:     keyID,
+		Algorithm: string(jose.RS256),
+		Use:       "sig",
+	}
+
+	jwksBody, err := json.Marshal(jose.JSONWebKeySet{Keys: []jose.JSONWebKey{jwk}})
+	require.NoError(t, err)
+
+	transport := &staticResponseTransport{
+		responses: map[string][]byte{
+			issuer + "/.well-known/openid-configuration": discoveryBody,
+			jwksURL: jwksBody,
+		},
+	}
+
+	return &oidcTestServer{
+		issuer:    issuer,
+		keyID:     keyID,
+		privKey:   privateKey,
+		transport: transport,
+	}
+}
+
+func (s *oidcTestServer) Context() context.Context {
+	return oidc.ClientContext(context.Background(), &http.Client{Transport: s.transport})
+}
+
+func (s *oidcTestServer) Config(clientID string) *kubeconfig.OidcConfig {
+	return &kubeconfig.OidcConfig{
+		ClientID:     clientID,
+		IdpIssuerURL: s.issuer,
+	}
+}
+
+func (s *oidcTestServer) Token(t *testing.T, audience string, expires time.Time) string {
+	t.Helper()
+
+	signerOpts := (&jose.SignerOptions{}).WithType("JWT").WithHeader("kid", s.keyID)
+	signer, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.RS256, Key: s.privKey}, signerOpts)
+	require.NoError(t, err)
+
+	claims := map[string]interface{}{
+		"iss": s.issuer,
+		"sub": "user-123",
+		"aud": audience,
+		"exp": expires.Unix(),
+		"iat": time.Now().Add(-time.Minute).Unix(),
+	}
+
+	payload, err := json.Marshal(claims)
+	require.NoError(t, err)
+
+	jws, err := signer.Sign(payload)
+	require.NoError(t, err)
+
+	token, err := jws.CompactSerialize()
+	require.NoError(t, err)
+
+	return token
+}
+
+func newHeadlampConfigWithCluster(
+	t *testing.T,
+	server *oidcTestServer,
+	cluster string,
+	clientID string,
+) (*HeadlampConfig, *kubeconfig.OidcConfig) {
+	t.Helper()
+
+	store := kubeconfig.NewContextStore()
+	oidcCfg := server.Config(clientID)
+
+	require.NoError(t, store.AddContext(&kubeconfig.Context{
+		Name:     cluster,
+		OidcConf: oidcCfg,
+	}))
+
+	return &HeadlampConfig{
+		HeadlampCFG: &headlampconfig.HeadlampCFG{
+			KubeConfigStore: store,
+		},
+	}, oidcCfg
+}
+
+func TestHeadlampConfig_getClusterOIDCVerifierCacheReuse(t *testing.T) {
+	oidcSrv := newOIDCTestServer(t)
+	cfg := &HeadlampConfig{}
+	oidcCfg := oidcSrv.Config("test-client")
+
+	ctx := oidcSrv.Context()
+
+	verifier1, err := cfg.getClusterOIDCVerifier(ctx, "cluster-a", oidcCfg)
+	require.NoError(t, err)
+	require.NotNil(t, verifier1)
+
+	cachedAny, ok := cfg.meVerifierCache.Load("cluster-a")
+	require.True(t, ok, "expected verifier cached for cluster")
+
+	cached := cachedAny.(oidcVerifierCacheEntry)
+	assert.Same(t, verifier1, cached.verifier)
+	assert.Equal(t, oidcCfg.ClientID, cached.clientID)
+	assert.Equal(t, oidcCfg.IdpIssuerURL, cached.issuer)
+
+	verifier2, err := cfg.getClusterOIDCVerifier(ctx, "cluster-a", oidcCfg)
+	require.NoError(t, err)
+	assert.Same(t, verifier1, verifier2, "expected cached verifier to be reused")
+}
+
+func TestHeadlampConfig_getClusterOIDCVerifierOverrides(t *testing.T) {
+	oidcSrv := newOIDCTestServer(t)
+	cfg := &HeadlampConfig{}
+	cluster := "cluster-b"
+	oidcCfg := oidcSrv.Config("original-client")
+
+	ctx := oidcSrv.Context()
+
+	verifier1, err := cfg.getClusterOIDCVerifier(ctx, cluster, oidcCfg)
+	require.NoError(t, err)
+
+	cfg.oidcValidatorClientID = "override-client"
+	cfg.oidcValidatorIdpIssuerURL = "https://validator.example.test"
+
+	verifier2, err := cfg.getClusterOIDCVerifier(ctx, cluster, oidcCfg)
+	require.NoError(t, err)
+	assert.NotSame(t, verifier1, verifier2, "expected verifier to be rebuilt after overrides")
+
+	cachedAny, ok := cfg.meVerifierCache.Load(cluster)
+	require.True(t, ok)
+
+	cached := cachedAny.(oidcVerifierCacheEntry)
+	assert.Same(t, verifier2, cached.verifier)
+	assert.Equal(t, cfg.oidcValidatorClientID, cached.clientID)
+	assert.Equal(t, cfg.oidcValidatorIdpIssuerURL, cached.issuer)
+}
+
+func TestHeadlampConfig_getClusterOIDCVerifierSkipTLSChange(t *testing.T) {
+	oidcSrv := newOIDCTestServer(t)
+	cfg := &HeadlampConfig{}
+	cluster := "cluster-tls"
+	oidcCfg := oidcSrv.Config("client")
+
+	ctx := oidcSrv.Context()
+
+	verifier1, err := cfg.getClusterOIDCVerifier(ctx, cluster, oidcCfg)
+	require.NoError(t, err)
+
+	falseValue := false
+	oidcCfg.SkipTLSVerify = &falseValue
+
+	verifier2, err := cfg.getClusterOIDCVerifier(ctx, cluster, oidcCfg)
+	require.NoError(t, err)
+	assert.NotSame(t, verifier1, verifier2, "expected verifier to be rebuilt after TLS settings change")
+
+	cachedAny, ok := cfg.meVerifierCache.Load(cluster)
+	require.True(t, ok)
+
+	cached := cachedAny.(oidcVerifierCacheEntry)
+	assert.Same(t, verifier2, cached.verifier)
+	assert.True(t, cached.skipTLSVerifySet)
+	assert.False(t, cached.skipTLSVerify)
+}
+
+func TestHeadlampConfig_getClusterOIDCVerifierCACertChange(t *testing.T) {
+	oidcSrv := newOIDCTestServer(t)
+	cfg := &HeadlampConfig{}
+	cluster := "cluster-ca"
+	oidcCfg := oidcSrv.Config("client")
+
+	ctx := oidcSrv.Context()
+
+	verifier1, err := cfg.getClusterOIDCVerifier(ctx, cluster, oidcCfg)
+	require.NoError(t, err)
+
+	cert := ""
+	oidcCfg.CACert = &cert
+
+	verifier2, err := cfg.getClusterOIDCVerifier(ctx, cluster, oidcCfg)
+	require.NoError(t, err)
+	assert.NotSame(t, verifier1, verifier2, "expected verifier to be rebuilt after CA change")
+
+	cachedAny, ok := cfg.meVerifierCache.Load(cluster)
+	require.True(t, ok)
+
+	cached := cachedAny.(oidcVerifierCacheEntry)
+	assert.Same(t, verifier2, cached.verifier)
+	assert.True(t, cached.caCertSet)
+	assert.Equal(t, cert, cached.caCert)
+}
+
+func TestHeadlampConfig_verifyMeTokenSkip(t *testing.T) {
+	prev := meSkipTokenVerification
+	meSkipTokenVerification = true
+
+	t.Cleanup(func() {
+		meSkipTokenVerification = prev
+	})
+
+	cfg := &HeadlampConfig{}
+
+	status, err := cfg.verifyMeToken(context.Background(), httptest.NewRequest(http.MethodGet, "/", nil),
+		"any-cluster", "token")
+	assert.Equal(t, 0, status)
+	require.NoError(t, err)
+}
+
+func TestHeadlampConfig_verifyMeTokenClusterMissing(t *testing.T) {
+	cfg := &HeadlampConfig{
+		HeadlampCFG: &headlampconfig.HeadlampCFG{
+			KubeConfigStore: kubeconfig.NewContextStore(),
+		},
+	}
+
+	status, err := cfg.verifyMeToken(context.Background(), httptest.NewRequest(http.MethodGet, "/", nil),
+		"missing-cluster", "token")
+	assert.Equal(t, http.StatusNotFound, status)
+	require.Error(t, err)
+}
+
+func TestHeadlampConfig_verifyMeTokenInvalidToken(t *testing.T) {
+	oidcSrv := newOIDCTestServer(t)
+	cluster := "cluster-invalid"
+
+	cfg, oidcCfg := newHeadlampConfigWithCluster(t, oidcSrv, cluster, "expected-client")
+
+	ctx := oidcSrv.Context()
+
+	_, err := cfg.getClusterOIDCVerifier(ctx, cluster, oidcCfg)
+	require.NoError(t, err)
+
+	token := oidcSrv.Token(t, "wrong-audience", time.Now().Add(2*time.Minute))
+
+	status, verifyErr := cfg.verifyMeToken(ctx,
+		httptest.NewRequest(http.MethodGet, "/", nil), cluster, token)
+
+	assert.Equal(t, http.StatusUnauthorized, status)
+	require.Error(t, verifyErr)
+}
+
+func TestHeadlampConfig_verifyMeTokenValidToken(t *testing.T) {
+	oidcSrv := newOIDCTestServer(t)
+	cluster := "cluster-valid"
+
+	cfg, oidcCfg := newHeadlampConfigWithCluster(t, oidcSrv, cluster, "valid-client")
+
+	ctx := oidcSrv.Context()
+
+	_, err := cfg.getClusterOIDCVerifier(ctx, cluster, oidcCfg)
+	require.NoError(t, err)
+
+	token := oidcSrv.Token(t, oidcCfg.ClientID, time.Now().Add(2*time.Minute))
+
+	status, verifyErr := cfg.verifyMeToken(ctx,
+		httptest.NewRequest(http.MethodGet, "/", nil), cluster, token)
+
+	assert.Equal(t, 0, status)
+	require.NoError(t, verifyErr)
 }

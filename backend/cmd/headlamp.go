@@ -34,6 +34,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -84,6 +85,84 @@ type HeadlampConfig struct {
 	telemetryConfig           cfg.Config
 	oidcScopes                []string
 	telemetryHandler          *telemetry.RequestHandler
+	// meUsernamePaths lists the JMESPath expressions tried for the username in /clusters/{cluster}/me.
+	meUsernamePaths string
+	// meEmailPaths lists the JMESPath expressions tried for the email in /clusters/{cluster}/me.
+	meEmailPaths string
+	// meGroupsPaths lists the JMESPath expressions tried for the groups in /clusters/{cluster}/me.
+	meGroupsPaths string
+	// meVerifierCache stores per-cluster OIDC verifiers so /me can reuse them without rediscovery.
+	meVerifierCache sync.Map
+}
+
+// oidcVerifierCacheEntry keeps a cached verifier alongside the client and issuer it was created for.
+type oidcVerifierCacheEntry struct {
+	// verifier is the prepared OIDC ID token verifier.
+	verifier *oidc.IDTokenVerifier
+	// clientID is the audience value used when the verifier was made.
+	clientID string
+	// issuer is the issuer URL tied to the verifier.
+	issuer string
+	// skipTLSVerifySet indicates if SkipTLSVerify was explicitly configured.
+	skipTLSVerifySet bool
+	// skipTLSVerify holds SkipTLSVerify when set.
+	skipTLSVerify bool
+	// caCertSet indicates if a custom CA certificate was provided.
+	caCertSet bool
+	// caCert contains the PEM-encoded CA certificate when provided.
+	caCert string
+}
+
+type oidcVerifierCacheKey struct {
+	clientID         string
+	issuer           string
+	skipTLSVerifySet bool
+	skipTLSVerify    bool
+	caCertSet        bool
+	caCert           string
+}
+
+func buildOIDCVerifierCacheKey(clientID, issuer string, cfg *kubeconfig.OidcConfig) oidcVerifierCacheKey {
+	key := oidcVerifierCacheKey{
+		clientID: clientID,
+		issuer:   issuer,
+	}
+
+	if cfg.SkipTLSVerify != nil {
+		key.skipTLSVerifySet = true
+		key.skipTLSVerify = *cfg.SkipTLSVerify
+	}
+
+	if cfg.CACert != nil {
+		key.caCertSet = true
+		key.caCert = *cfg.CACert
+	}
+
+	return key
+}
+
+func (key oidcVerifierCacheKey) matches(entry oidcVerifierCacheEntry) bool {
+	if entry.clientID != key.clientID || entry.issuer != key.issuer {
+		return false
+	}
+
+	if entry.skipTLSVerifySet != key.skipTLSVerifySet {
+		return false
+	}
+
+	if key.skipTLSVerifySet && entry.skipTLSVerify != key.skipTLSVerify {
+		return false
+	}
+
+	if entry.caCertSet != key.caCertSet {
+		return false
+	}
+
+	if key.caCertSet && entry.caCert != key.caCert {
+		return false
+	}
+
+	return true
 }
 
 const DrainNodeCacheTTL = 20 // seconds
@@ -104,6 +183,9 @@ const (
 	// TokenCacheFileName is the name of the token cache file.
 	TokenCacheFileName = "headlamp-token-cache"
 )
+
+// meSkipTokenVerification can be flipped to true to disable verifying cluster tokens for /me.
+var meSkipTokenVerification = false
 
 type clientConfig struct {
 	Clusters                []Cluster `json:"clusters"`
@@ -476,6 +558,18 @@ func createHeadlampHandler(config *HeadlampConfig) http.Handler {
 	r.HandleFunc("/clusters/{clusterName}/portforward", func(w http.ResponseWriter, r *http.Request) {
 		portforward.GetPortForwardByID(config.cache, w, r)
 	}).Methods("GET")
+
+	// Expose user info so the frontend can show the current user in the top bar using the per-cluster auth cookie.
+	meHandlerOpts := auth.MeHandlerOptions{
+		UsernamePaths: config.meUsernamePaths,
+		EmailPaths:    config.meEmailPaths,
+		GroupsPaths:   config.meGroupsPaths,
+	}
+	if !meSkipTokenVerification {
+		meHandlerOpts.VerifyToken = config.verifyMeToken
+	}
+
+	r.HandleFunc("/clusters/{clusterName}/me", auth.HandleMe(meHandlerOpts)).Methods("GET")
 
 	config.handleClusterRequests(r)
 
@@ -2381,4 +2475,98 @@ func (c *HeadlampConfig) handleSetToken(w http.ResponseWriter, r *http.Request) 
 	}
 
 	w.WriteHeader(http.StatusOK)
+}
+
+// verifyMeToken re-validates the per-cluster auth cookie using the cluster's OIDC verifier.
+func (c *HeadlampConfig) verifyMeToken(ctx context.Context, r *http.Request,
+	cluster, token string,
+) (int, error) {
+	if meSkipTokenVerification {
+		return 0, nil
+	}
+
+	kContext, err := c.KubeConfigStore.GetContext(cluster)
+	if err != nil {
+		logger.Log(logger.LevelError, map[string]string{"cluster": cluster}, err,
+			"failed to get context for token verification")
+		return http.StatusNotFound, fmt.Errorf("cluster not found")
+	}
+
+	oidcAuthConfig, err := kContext.OidcConfig()
+	if err != nil {
+		logger.Log(logger.LevelError, map[string]string{"cluster": cluster}, err,
+			"failed to get oidc config for token verification")
+		return http.StatusUnauthorized, fmt.Errorf("unauthorized")
+	}
+
+	verifier, err := c.getClusterOIDCVerifier(ctx, cluster, oidcAuthConfig)
+	if err != nil {
+		logger.Log(logger.LevelError, map[string]string{"cluster": cluster}, err,
+			"failed to prepare oidc verifier")
+		return http.StatusInternalServerError, fmt.Errorf("failed to verify token")
+	}
+
+	verifyCtx := auth.ConfigureTLSContext(ctx, oidcAuthConfig.SkipTLSVerify, oidcAuthConfig.CACert)
+	if c.oidcValidatorIdpIssuerURL != "" {
+		verifyCtx = oidc.InsecureIssuerURLContext(verifyCtx, c.oidcValidatorIdpIssuerURL)
+	}
+
+	if _, err := verifier.Verify(verifyCtx, token); err != nil {
+		logger.Log(logger.LevelError, map[string]string{"cluster": cluster}, err,
+			"token verification failed")
+		return http.StatusUnauthorized, fmt.Errorf("invalid token")
+	}
+
+	return 0, nil
+}
+
+// getClusterOIDCVerifier returns a cached OIDC ID token verifier for the given cluster,
+// initialising it when necessary with the cluster-specific TLS and client settings.
+func (c *HeadlampConfig) getClusterOIDCVerifier(ctx context.Context, cluster string,
+	oidcAuthConfig *kubeconfig.OidcConfig,
+) (*oidc.IDTokenVerifier, error) {
+	clientID := oidcAuthConfig.ClientID
+	if c.oidcValidatorClientID != "" {
+		clientID = c.oidcValidatorClientID
+	}
+
+	issuer := oidcAuthConfig.IdpIssuerURL
+	if c.oidcValidatorIdpIssuerURL != "" {
+		issuer = c.oidcValidatorIdpIssuerURL
+	}
+
+	key := buildOIDCVerifierCacheKey(clientID, issuer, oidcAuthConfig)
+
+	if cached, ok := c.meVerifierCache.Load(cluster); ok {
+		entry := cached.(oidcVerifierCacheEntry)
+		if key.matches(entry) {
+			return entry.verifier, nil
+		}
+	}
+
+	providerCtx := auth.ConfigureTLSContext(ctx, oidcAuthConfig.SkipTLSVerify, oidcAuthConfig.CACert)
+	if c.oidcValidatorIdpIssuerURL != "" {
+		providerCtx = oidc.InsecureIssuerURLContext(providerCtx, c.oidcValidatorIdpIssuerURL)
+	}
+
+	provider, err := oidc.NewProvider(providerCtx, oidcAuthConfig.IdpIssuerURL)
+	if err != nil {
+		return nil, err
+	}
+
+	verifier := provider.Verifier(&oidc.Config{
+		ClientID: clientID,
+	})
+
+	c.meVerifierCache.Store(cluster, oidcVerifierCacheEntry{
+		verifier:         verifier,
+		clientID:         key.clientID,
+		issuer:           key.issuer,
+		skipTLSVerifySet: key.skipTLSVerifySet,
+		skipTLSVerify:    key.skipTLSVerify,
+		caCertSet:        key.caCertSet,
+		caCert:           key.caCert,
+	})
+
+	return verifier, nil
 }
