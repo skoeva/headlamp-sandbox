@@ -1,0 +1,61 @@
+# Dependabot configuration.
+#
+# npm: security updates only. Version updates are disabled with
+# open-pull-requests-limit: 0, which does not limit security update PRs.
+# Security updates are grouped so that one advisory affecting many lockfiles
+# (for example the example plugins) does not open one PR per directory.
+version: 2
+updates:
+  - package-ecosystem: "npm"
+    directories:
+      - "/"
+      - "/frontend"
+      - "/app"
+      - "/app/e2e-tests"
+      - "/app/scripts/push-release-assets"
+      - "/e2e-tests"
+      - "/eslint-config"
+      - "/load-tests"
+      - "/plugins/headlamp-plugin"
+      - "/plugins/headlamp-plugin/template"
+      - "/plugins/pluginctl"
+      - "/plugins/examples/*"
+      - "/tools/*"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 0
+    groups:
+      npm-security:
+        applies-to: security-updates
+        patterns: ["*"]
+
+  - package-ecosystem: "gomod"
+    directory: "/backend"
+    schedule:
+      interval: "weekly"
+    groups:
+      go-security:
+        applies-to: security-updates
+        patterns: ["*"]
+      go-minor-patch:
+        applies-to: version-updates
+        update-types: ["minor", "patch"]
+        patterns: ["*"]
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: "docker"
+    directories:
+      - "/"
+      - "/docker-extension"
+    schedule:
+      interval: "weekly"
+    groups:
+      docker:
+        patterns: ["*"]
