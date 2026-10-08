@@ -41,13 +41,21 @@ updates:
         applies-to: version-updates
         update-types: ["minor", "patch"]
         patterns: ["*"]
+      go-major:
+        applies-to: version-updates
+        update-types: ["major"]
+        patterns: ["*"]
 
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
     groups:
-      actions:
+      actions-minor-patch:
+        update-types: ["minor", "patch"]
+        patterns: ["*"]
+      actions-major:
+        update-types: ["major"]
         patterns: ["*"]
 
   - package-ecosystem: "docker"
@@ -56,6 +64,13 @@ updates:
       - "/docker-extension"
     schedule:
       interval: "weekly"
+    # Node and Go base image upgrades are coordinated with CI and go.mod, so
+    # only take patch updates for them here.
+    ignore:
+      - dependency-name: "node"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "golang"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
     groups:
       docker:
         patterns: ["*"]
