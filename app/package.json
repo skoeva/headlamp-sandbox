@@ -201,13 +201,13 @@
     "@vitest/coverage-istanbul": "4.1.12",
     "ajv": "^8.18.0",
     "ajv-formats": "^3.0.1",
-    "electron": "^38.8.6",
+    "electron": "^42.11.16",
     "electron-builder": "^26.6.0",
     "esbuild": "^0.25.0",
     "i18next-parser": "^9.0.0",
     "typescript": "5.5.4",
     "vite": "^7.3.6",
-    "vitest": "^4.1.12"
+    "vitest": "^5.0.5"
   },
   "overrides": {
     "typescript": "5.5.4",
