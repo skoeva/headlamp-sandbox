@@ -2,10 +2,10 @@
 # Final container image. Override it with --build-arg IMAGE_BASE=<image>. The
 # default is on its own FROM line so that Dependabot can update it.
 ARG IMAGE_BASE=default-image-base
-FROM alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a AS default-image-base
+FROM alpine:3.24.4@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf AS default-image-base
 FROM ${IMAGE_BASE} AS image-base
 
-FROM --platform=${BUILDPLATFORM} golang:1.26.10@sha256:670bb5aa5349ae03b8516764718486f4f16399134bdc9acd0c46a23f043ab05c AS backend-build
+FROM --platform=${BUILDPLATFORM} golang:1.26.10@sha256:cfa27959837144bf4649802ba38e59daffd0dd2a7994aa83daaf113285b0f551 AS backend-build
 WORKDIR /headlamp
 
 ARG TARGETOS
