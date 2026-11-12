@@ -82,6 +82,7 @@ jobs:
       - name: Scan Go, JavaScript, and TypeScript
         run: |
           semgrep scan \
+            --strict \
             --config selected-rules.yml \
             --exclude .semgrep-rules \
             --exclude selected-rules.yml \
