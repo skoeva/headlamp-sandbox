@@ -94,6 +94,10 @@ jobs:
             --output semgrep.sarif \
             .
 
+      - name: Diagnose scan errors
+        if: failure()
+        run: jq '.runs[].invocations[]? | {executionSuccessful, toolExecutionNotifications}' semgrep.sarif
+
       - name: Summarize SARIF
         run: |
           jq -e '.runs | length > 0' semgrep.sarif
