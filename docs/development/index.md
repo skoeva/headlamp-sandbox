@@ -25,6 +25,25 @@ You can install the required frontend, app, and backend dependencies by running:
 npm run install:all
 ```
 
+## Code scanning
+
+The [Semgrep workflow](https://github.com/kubernetes-sigs/headlamp/blob/main/.github/workflows/semgrep.yml)
+scans Go, JavaScript, and TypeScript on every pull request targeting `main`,
+including fork and documentation-only PRs, and on pushes to `main`. It also runs
+weekly and supports manual runs.
+
+It supplements CodeQL default setup without requiring a Semgrep account or
+secrets. Rules and scanner versions are pinned; only high-confidence security
+rules are selected. Scanning is local, telemetry is disabled, and SARIF results
+are uploaded to GitHub code scanning. Findings are reported without failing the
+job; scanner and upload failures still fail it. Review findings before requiring
+a clean code-scanning result for merges.
+
+OpenSSF Scorecard recognizes successful code-scanning checks on recent merged
+PR heads. Its SAST score may improve gradually as scanned PRs enter that history.
+When updating the scanner or rule revision, verify rule selection and successful
+SARIF processing on a fork PR.
+
 ## Build the code
 
 Headlamp is composed of a `backend` and a `frontend`.
