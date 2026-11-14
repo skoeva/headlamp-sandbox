@@ -63,6 +63,10 @@ func (r AddUpdateRepoRequest) Validate() error {
 		return errors.New("name is required")
 	}
 
+	if strings.ContainsAny(r.Name, `/\`) || strings.Contains(r.Name, "..") {
+		return errors.New("name must not contain path separators or '..'")
+	}
+
 	if strings.TrimSpace(r.URL) == "" {
 		return errors.New("url is required")
 	}
@@ -97,6 +101,7 @@ func lockRepositoryFile(lockCtx context.Context, repositoryConfig string) (bool,
 
 	fileLock := flock.New(lockPath)
 
+	// The context bounds the total wait; this duration controls how often the lock is retried.
 	locked, err := fileLock.TryLockContext(lockCtx, time.Second)
 
 	return locked, fileLock, err

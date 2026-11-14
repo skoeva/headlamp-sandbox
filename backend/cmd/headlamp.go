@@ -169,6 +169,10 @@ var maxProxyResponseSize int64 = 100 * 1024 * 1024
 //nolint:gochecknoglobals // allow test override
 var externalProxyTimeout = 30 * time.Second
 
+// maxProxyRedirects is the maximum number of redirects the external proxy
+// will follow, matching net/http's own default redirect limit.
+const maxProxyRedirects = 10
+
 // oidcRequestTimeout is the maximum time to wait for the identity provider on each request,
 // such as discovery and the token exchange.
 //
@@ -192,16 +196,17 @@ const (
 )
 
 type clientConfig struct {
-	Clusters                  []Cluster `json:"clusters"`
-	IsDynamicClusterEnabled   bool      `json:"isDynamicClusterEnabled"`
-	AllowKubeconfigChanges    bool      `json:"allowKubeconfigChanges"`
-	DefaultPodDebugImage      string    `json:"defaultPodDebugImage"`
-	DefaultNodeShellImage     string    `json:"defaultNodeShellImage"`
-	DefaultNodeShellNamespace string    `json:"defaultNodeShellNamespace"`
-	DefaultLightTheme         string    `json:"defaultLightTheme,omitempty"`
-	DefaultDarkTheme          string    `json:"defaultDarkTheme,omitempty"`
-	ForceTheme                string    `json:"forceTheme,omitempty"`
-	OidcAutoLogin             bool      `json:"oidcAutoLogin"`
+	Clusters                  []Cluster       `json:"clusters"`
+	IsDynamicClusterEnabled   bool            `json:"isDynamicClusterEnabled"`
+	AllowKubeconfigChanges    bool            `json:"allowKubeconfigChanges"`
+	DefaultPodDebugImage      string          `json:"defaultPodDebugImage"`
+	DefaultNodeShellImage     string          `json:"defaultNodeShellImage"`
+	DefaultNodeShellNamespace string          `json:"defaultNodeShellNamespace"`
+	DefaultLightTheme         string          `json:"defaultLightTheme,omitempty"`
+	DefaultDarkTheme          string          `json:"defaultDarkTheme,omitempty"`
+	ForceTheme                string          `json:"forceTheme,omitempty"`
+	OidcAutoLogin             bool            `json:"oidcAutoLogin"`
+	AdminSettings             json.RawMessage `json:"adminSettings,omitempty"`
 }
 
 type OauthConfig struct {
@@ -316,7 +321,7 @@ func getUrlScheme(r *http.Request) string {
 	urlScheme := r.URL.Scheme
 	if urlScheme == "" {
 		// check proxy headers first
-		fwdProto := r.Header.Get("X-Forwarded-Proto")
+		fwdProto := auth.GetForwardedProto(r)
 
 		switch {
 		case fwdProto != "":
@@ -1216,9 +1221,30 @@ func createHeadlampHandler(ctx context.Context, config *HeadlampConfig) http.Han
 		w.Header().Set("Pragma", "no-cache")
 		w.Header().Set("X-Accel-Expires", "0")
 
-		client := http.Client{}
+		client := http.Client{
+			// The initial proxyURL is checked against the allowed proxy URLs above, but the
+			// default client follows redirects without re-checking them. Re-validate every
+			// redirect target so a response can't send the proxy to a non-allowed URL.
+			CheckRedirect: func(redirectReq *http.Request, via []*http.Request) error {
+				if len(via) >= maxProxyRedirects {
+					return fmt.Errorf("stopped after %d redirects", maxProxyRedirects)
+				}
 
-		resp, err := client.Do(proxyReq) //nolint:gosec // Target URL is validated against allowed proxy URLs whitelist
+				redirectAllowed, err := config.proxyURLAllowed(redirectReq.URL.String())
+				if err != nil {
+					return fmt.Errorf("compiling proxy URL patterns: %w", err)
+				}
+
+				if !redirectAllowed {
+					return fmt.Errorf("redirect target %q is not in the allowed proxy URLs", redirectReq.URL.String())
+				}
+
+				return nil
+			},
+		}
+
+		//nolint:gosec // Target URL and any redirects are validated against the allowed proxy URLs whitelist
+		resp, err := client.Do(proxyReq)
 		if err != nil {
 			logger.Log(logger.LevelError, nil, err, "making request")
 			http.Error(w, err.Error(), http.StatusBadGateway)
@@ -1527,6 +1553,26 @@ func createHeadlampHandler(ctx context.Context, config *HeadlampConfig) http.Han
 			return
 		}
 
+		idToken, err := oauthConfig.Verifier.Verify(oauthConfig.Ctx, rawUserToken)
+		if err != nil {
+			logger.Log(logger.LevelError, nil, err, "failed to verify ID Token")
+			http.Error(w, "Failed to verify ID Token: "+err.Error(), http.StatusInternalServerError)
+
+			return
+		}
+
+		resp := struct {
+			OAuth2Token   *oauth2.Token
+			IDTokenClaims *json.RawMessage // ID Token payload is just JSON.
+		}{oauth2Token, new(json.RawMessage)}
+
+		if err := idToken.Claims(&resp.IDTokenClaims); err != nil {
+			logger.Log(logger.LevelError, nil, err, "failed to get id token claims")
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+
+			return
+		}
+
 		rawIDToken, _ := oauth2Token.Extra("id_token").(string)
 		if rawIDToken == "" && tokenType == "id_token" {
 			rawIDToken = rawUserToken
@@ -1549,26 +1595,6 @@ func createHeadlampHandler(ctx context.Context, config *HeadlampConfig) http.Han
 		); err != nil {
 			logger.Log(logger.LevelError, nil, err, "failed to cache ID token")
 			http.Error(w, "Failed to cache ID token: "+err.Error(), http.StatusInternalServerError)
-
-			return
-		}
-
-		idToken, err := oauthConfig.Verifier.Verify(oauthConfig.Ctx, rawUserToken)
-		if err != nil {
-			logger.Log(logger.LevelError, nil, err, "failed to verify ID Token")
-			http.Error(w, "Failed to verify ID Token: "+err.Error(), http.StatusInternalServerError)
-
-			return
-		}
-
-		resp := struct {
-			OAuth2Token   *oauth2.Token
-			IDTokenClaims *json.RawMessage // ID Token payload is just JSON.
-		}{oauth2Token, new(json.RawMessage)}
-
-		if err := idToken.Claims(&resp.IDTokenClaims); err != nil {
-			logger.Log(logger.LevelError, nil, err, "failed to get id token claims")
-			http.Error(w, err.Error(), http.StatusInternalServerError)
 
 			return
 		}
@@ -2690,7 +2716,7 @@ func parseClusterFromKubeConfig(kubeConfigs []string) ([]Cluster, []error) {
 func (c *HeadlampConfig) getConfig(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
-	clientConfig := clientConfig{
+	cc := clientConfig{
 		Clusters:                  c.getClusters(),
 		IsDynamicClusterEnabled:   c.EnableDynamicClusters,
 		AllowKubeconfigChanges:    c.AllowKubeconfigChanges,
@@ -2703,7 +2729,11 @@ func (c *HeadlampConfig) getConfig(w http.ResponseWriter, r *http.Request) {
 		OidcAutoLogin:             c.OidcAutoLogin,
 	}
 
-	if err := json.NewEncoder(w).Encode(&clientConfig); err != nil {
+	if c.AdminSettings != nil {
+		cc.AdminSettings = c.AdminSettings
+	}
+
+	if err := json.NewEncoder(w).Encode(&cc); err != nil {
 		logger.Log(logger.LevelError, nil, err, "encoding config")
 	}
 }
@@ -3640,12 +3670,22 @@ func (c *HeadlampConfig) handleNodeDrainStatus(w http.ResponseWriter, r *http.Re
 
 		return
 	}
+	// The cache is shared and typed as interface{}, so guard the assertion
+	// instead of letting a non-string value panic the handler.
+	id, ok := cacheItem.(string)
+	if !ok {
+		c.handleError(w, ctx, span, fmt.Errorf("unexpected cache value type %T", cacheItem),
+			"invalid drain status", http.StatusInternalServerError)
+
+		return
+	}
+
 	// Prepare successful response
 	responsePayload := struct {
 		ID      string `json:"id"`
 		Cluster string `json:"cluster"`
 	}{
-		ID:      cacheItem.(string),
+		ID:      id,
 		Cluster: drainPayload.Cluster,
 	}
 
