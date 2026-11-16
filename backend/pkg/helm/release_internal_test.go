@@ -51,6 +51,60 @@ func TestGetActionStatus_NilErr(t *testing.T) {
 	assert.Contains(t, rr.Body.String(), "action failed with error: unknown error")
 }
 
+func TestGetActionStatusErrors(t *testing.T) {
+	h := &Handler{Cache: cache.New[interface{}]()}
+	tests := []struct {
+		name       string
+		query      string
+		wantStatus int
+		wantError  string
+	}{
+		{
+			name:       "unknown query parameter",
+			query:      "action=install&name=test-release&unexpected=value",
+			wantStatus: http.StatusBadRequest,
+			wantError:  `invalid path "unexpected"`,
+		},
+		{
+			name:       "missing release name",
+			query:      "action=install",
+			wantStatus: http.StatusBadRequest,
+			wantError:  "'Name' failed on the 'required' tag",
+		},
+		{
+			name:       "missing action",
+			query:      "name=test-release",
+			wantStatus: http.StatusBadRequest,
+			wantError:  "'Action' failed on the 'required' tag",
+		},
+		{
+			name:       "unsupported action",
+			query:      "action=delete&name=test-release",
+			wantStatus: http.StatusBadRequest,
+			wantError:  "invalid action",
+		},
+		{
+			name:       "missing cached status",
+			query:      "action=install&name=missing-release",
+			wantStatus: http.StatusInternalServerError,
+			wantError:  "key not found",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequestWithContext(context.Background(),
+				http.MethodGet, "/helm/releases/status?"+tt.query, nil)
+			rr := httptest.NewRecorder()
+
+			h.GetActionStatus(nil, rr, req)
+
+			assert.Equal(t, tt.wantStatus, rr.Code)
+			assert.Contains(t, rr.Body.String(), tt.wantError)
+		})
+	}
+}
+
 func TestGetChart_InvalidType(t *testing.T) {
 	h := &Handler{
 		Cache:       cache.New[interface{}](),
