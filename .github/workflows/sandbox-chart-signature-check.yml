@@ -1,0 +1,116 @@
+name: Sandbox chart signature verification
+
+on:
+  push:
+    branches:
+      - experiment/chart-signature-check
+    paths:
+      - .github/workflows/sandbox-chart-signature-check.yml
+
+permissions:
+  contents: read
+
+jobs:
+  verify-fixture:
+    if: github.repository == 'skoeva/headlamp-sandbox'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      IDENTITY: https://github.com/skoeva/headlamp-sandbox/.github/workflows/sandbox-chart-signature-check.yml@refs/heads/experiment/chart-signature-check
+      ISSUER: https://token.actions.githubusercontent.com
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Package fixture chart
+        shell: bash
+        run: |
+          version="0.0.0-sandbox.${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}"
+          mkdir -p fixture-chart/templates fixture-release
+          printf 'apiVersion: v2\nname: headlamp\nversion: %s\n' "$version" > fixture-chart/Chart.yaml
+          printf 'apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: signature-fixture\n' \
+            > fixture-chart/templates/configmap.yaml
+          helm package fixture-chart --destination fixture-release
+          echo "PKG=headlamp-${version}.tgz" >> "$GITHUB_ENV"
+          echo "TAG=headlamp-helm-${version}" >> "$GITHUB_ENV"
+      - name: Sign fixture package with real GitHub OIDC
+        shell: bash
+        run: |
+          cosign sign-blob --yes \
+            --bundle "fixture-release/${PKG}.sigstore.json" \
+            "fixture-release/${PKG}"
+      - name: Attest fixture package
+        id: attest
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: fixture-release/*.tgz
+      - name: Publish isolated fixture prerelease
+        shell: bash
+        env:
+          BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          cp "$BUNDLE_PATH" "fixture-release/${PKG}.intoto.jsonl"
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --prerelease --latest=false \
+            --title "Sandbox chart verification fixture ${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}" \
+            --notes "Test fixture only. Not a Headlamp product release; no chart repository or registry publication." \
+            "fixture-release/${PKG}" \
+            "fixture-release/${PKG}.sigstore.json" \
+            "fixture-release/${PKG}.intoto.jsonl"
+      - name: Run exact proposed gate with sandbox identity
+        shell: bash
+        env:
+          CHANGED_CHARTS: fixture-chart
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import textwrap
+
+          source = Path(".github/workflows/helm-chart-release.yml").read_text()
+          step = source.split("      - name: Verify published chart signatures and provenance\n", 1)[1]
+          script = textwrap.dedent(step.split("        run: |\n", 1)[1])
+          upstream_identity = "https://github.com/kubernetes-sigs/headlamp/.github/workflows/helm-chart-release.yml@refs/heads/main"
+          assert script.count(upstream_identity) == 1
+          script = script.replace(upstream_identity, os.environ["IDENTITY"])
+          Path(os.environ["RUNNER_TEMP"], "verify-chart-release.sh").write_text(script)
+          PY
+          bash --noprofile --norc -eo pipefail "$RUNNER_TEMP/verify-chart-release.sh"
+      - name: Reject modified package and incorrect identities
+        shell: bash
+        run: |
+          cp "fixture-release/${PKG}" "$RUNNER_TEMP/modified-chart.tgz"
+          printf 'modified' >> "$RUNNER_TEMP/modified-chart.tgz"
+          for verifier in verify-blob verify-blob-attestation; do
+            bundle="fixture-release/${PKG}.sigstore.json"
+            args=()
+            if [ "$verifier" = verify-blob-attestation ]; then
+              bundle="fixture-release/${PKG}.intoto.jsonl"
+              args=(--type https://slsa.dev/provenance/v1)
+            fi
+            if cosign "$verifier" "$RUNNER_TEMP/modified-chart.tgz" \
+              --bundle "$bundle" "${args[@]}" \
+              --certificate-identity "$IDENTITY" --certificate-oidc-issuer "$ISSUER"; then
+              echo "::error::${verifier} accepted a modified package"
+              exit 1
+            fi
+            if cosign "$verifier" "fixture-release/${PKG}" \
+              --bundle "$bundle" "${args[@]}" \
+              --certificate-identity 'https://github.com/incorrect/repository/workflow.yml@refs/heads/main' \
+              --certificate-oidc-issuer "$ISSUER"; then
+              echo "::error::${verifier} accepted an incorrect identity"
+              exit 1
+            fi
+          done
+          {
+            echo "## Sandbox verification results"
+            echo "- Real GitHub OIDC signature and SLSA provenance created."
+            echo "- Proposed gate verified the published fixture with only its expected identity changed."
+            echo "- Both verifiers rejected modified bytes and an incorrect identity."
+            echo "- Fixture prerelease: https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
+          } >> "$GITHUB_STEP_SUMMARY"
