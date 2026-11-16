@@ -1,6 +1,7 @@
 name: Backend test
 
 on:
+  workflow_dispatch:
   pull_request:
     paths:
       - 'backend/**'
@@ -82,5 +83,7 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: backend-coverage-report
-          path: ./backend/backend_coverage.html
+          path: |
+            ./backend/backend_coverage.html
+            ./backend/coverage.out
 
