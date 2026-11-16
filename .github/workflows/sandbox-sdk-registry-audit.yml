@@ -1,0 +1,89 @@
+name: Sandbox SDK canonical registry audit
+
+on:
+  push:
+    branches: [experiment/sdk-registry-audit]
+    paths: [.github/workflows/sandbox-sdk-registry-audit.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    if: github.repository == 'skoeva/headlamp-sandbox'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Audit canonical metadata and registry signatures without installing packages
+        shell: bash
+        run: |
+          mkdir audit
+          node - <<'NODE'
+          const fs = require('node:fs');
+          const crypto = require('node:crypto');
+          async function get(url) {
+            const response = await fetch(url);
+            if (!response.ok) throw new Error(`${url}: HTTP ${response.status}`);
+            return response;
+          }
+          async function main() {
+            const name = '@kinvolk/headlamp-plugin';
+            const root = 'https://registry.npmjs.org';
+            const metadata = await (await get(`${root}/@kinvolk%2fheadlamp-plugin`)).json();
+            const keys = await (await get(`${root}/-/npm/v1/keys`)).json();
+            const versions = [...new Set([metadata['dist-tags'].latest, metadata['dist-tags'].alpha])];
+            const results = [];
+            for (const version of versions) {
+              const entry = metadata.versions[version];
+              if (!entry || entry.name !== name) throw new Error('Unexpected package metadata');
+              const signatures = entry.dist.signatures || [];
+              const verified = [];
+              for (const signature of signatures) {
+                const key = keys.keys.find(key => key.keyid === signature.keyid);
+                if (!key) throw new Error(`Registry key unavailable: ${signature.keyid}`);
+                const publicKey = crypto.createPublicKey({
+                  key: Buffer.from(key.key, 'base64'), format: 'der', type: 'spki',
+                });
+                const message = Buffer.from(`${name}@${version}:${entry.dist.integrity}`);
+                if (!crypto.verify('sha256', message, publicKey, Buffer.from(signature.sig, 'base64'))) {
+                  throw new Error(`Invalid registry signature: ${version}`);
+                }
+                verified.push({ keyid: key.keyid, expires: key.expires });
+              }
+              const tarballURL = new URL(entry.dist.tarball);
+              if (tarballURL.origin !== root) throw new Error('Unexpected tarball host');
+              const tarball = Buffer.from(await (await get(tarballURL)).arrayBuffer());
+              const integrity = 'sha512-' + crypto.createHash('sha512').update(tarball).digest('base64');
+              if (integrity !== entry.dist.integrity) throw new Error('Tarball integrity mismatch');
+              const result = {
+                name, version, distTags: metadata['dist-tags'],
+                integrity, registrySignatures: verified,
+                attestations: entry.dist.attestations || null,
+                repository: entry.repository || null,
+                gitHead: entry.gitHead || null,
+              };
+              if (entry.dist.attestations?.url) {
+                const url = new URL(entry.dist.attestations.url);
+                if (url.origin !== root) throw new Error('Unexpected attestation host');
+                const attestations = await (await get(url)).json();
+                fs.writeFileSync(`audit/${version}-attestations.json`, JSON.stringify(attestations, null, 2));
+                result.attestationTypes = attestations.attestations.map(item => item.predicateType);
+              }
+              results.push(result);
+            }
+            fs.writeFileSync('audit/results.json', JSON.stringify(results, null, 2));
+            fs.writeFileSync('audit/registry-keys.json', JSON.stringify(keys, null, 2));
+            console.log(JSON.stringify(results, null, 2));
+            fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY,
+              'Read-only canonical npm audit: metadata fetched directly, registry signatures checked where present, and tarball SHA-512 verified. No package installation, lifecycle scripts, credentials, or publication.\n');
+          }
+          main().catch(error => { console.error(error); process.exitCode = 1; });
+          NODE
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sdk-canonical-audit
+          path: audit/
+          if-no-files-found: error
