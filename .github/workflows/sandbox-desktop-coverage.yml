@@ -28,11 +28,16 @@ jobs:
           cache-dependency-path: backend/go.sum
       - run: npm --prefix app ci
       - run: npm --prefix app/e2e-tests ci
-      - run: npm run backend:build
+      - if: runner.os != 'Windows'
+        run: npm run backend:build
+      - if: runner.os == 'Windows'
+        run: go build -C backend -o headlamp-server.exe ./cmd
       - if: runner.os == 'Linux'
         run: npm --prefix app/e2e-tests exec -- playwright install --with-deps chromium
       - name: Validate Windows coverage
         if: runner.os == 'Windows'
+        env:
+          DEBUG: pw:browser
         run: npm run app:test:coverage -- appMenuZoom.spec.ts buildManifest.spec.ts clusterRegistration.spec.ts externalBackendToken.spec.ts listenerCleanup.spec.ts pluginManager.spec.ts
       - name: Validate Linux coverage
         if: runner.os == 'Linux'
