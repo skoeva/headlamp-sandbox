@@ -2,10 +2,11 @@ package headlampconfig
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
-	"time"
 
 	"github.com/kubernetes-sigs/headlamp/backend/pkg/cache"
+	"github.com/kubernetes-sigs/headlamp/backend/pkg/clusterdiscovery"
 	"github.com/kubernetes-sigs/headlamp/backend/pkg/config"
 	"github.com/kubernetes-sigs/headlamp/backend/pkg/kubeconfig"
 	"github.com/kubernetes-sigs/headlamp/backend/pkg/telemetry"
@@ -29,6 +30,16 @@ type HeadlampConfig struct {
 	OidcUseAccessToken        bool
 	OidcSkipTLSVerify         bool
 	OidcCACert                string
+	// OidcAPIProxy is the URL of an external Kubernetes API proxy. When
+	// set, cluster API requests are routed through this URL instead of
+	// the kube-apiserver from the kubeconfig. The OIDC bearer token is
+	// forwarded as-is in the Authorization header.
+	OidcAPIProxy string
+	// OidcAPIProxyCACert is the PEM-encoded CA bundle used to verify the
+	// api-proxy TLS certificate. Optional.
+	OidcAPIProxyCACert string
+	// OidcAPIProxySkipTLSVerify disables TLS verification for the api-proxy.
+	OidcAPIProxySkipTLSVerify bool
 	OidcUsePKCE               bool
 	OidcSkipLogout            bool
 	OidcScopes                []string
@@ -46,6 +57,7 @@ type HeadlampConfig struct {
 	ProxyAuthEmailHeader      string
 	ProxyAuthTokenHeader      string
 	ServerCtx                 context.Context
+	AdminSettings             json.RawMessage
 }
 
 type HeadlampCFG struct {
@@ -73,6 +85,7 @@ type HeadlampCFG struct {
 	Metrics                *telemetry.Metrics
 	BaseURL                string
 	ProxyURLs              []string
+	BackstageOrigin        string
 
 	TLSCertPath                  string
 	TLSKeyPath                   string
@@ -88,10 +101,5 @@ type HeadlampCFG struct {
 	UnsafeUseServiceAccountToken bool
 	ServiceAccountTokenPath      string
 
-	EnableClusterInventory                bool
-	ClusterInventoryProviderFile          string
-	ClusterInventoryLabelSelector         string
-	ClusterInventoryNamespaces            string
-	ClusterInventoryRootReconcileInterval time.Duration
-	ClusterInventoryNoCRDCacheTTL         time.Duration
+	DiscoverySources map[string]clusterdiscovery.Settings
 }

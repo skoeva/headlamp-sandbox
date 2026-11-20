@@ -30,6 +30,51 @@ npm run backend:start
 The development launcher forwards `SIGINT`, `SIGTERM`, `SIGHUP`, and `SIGBREAK`
 to the backend, matching cross-env's signal handling.
 
+### Compiler flags and debugging information
+
+The npm and Makefile backend builds use a shared Go driver with no external
+dependencies. Make backend builds do not require Node.js. The npm path uses a
+small Node.js launcher, which does not add a requirement beyond npm itself.
+The stdlib-only bootstrap ignores surrounding module requirements; the actual
+backend build retains the caller's module and automatic toolchain settings.
+With no linker overrides, both retain the existing `-trimpath`, `-s`, and `-w`
+defaults.
+
+`GOFLAGS` settings, including those saved with `go env -w`, are honored.
+Use Go's `-ldflags` setting in `GOFLAGS` to replace the default stripping flags.
+Makefile builds retain the application version and name, and embedded builds add
+the required `embed` tag without discarding caller-supplied build tags.
+Package-specific `-ldflags` settings keep Go's matching and precedence rules.
+
+To retain symbol tables and DWARF debugging information:
+
+```bash
+GOFLAGS='-ldflags=' npm run backend:build
+GOFLAGS='-ldflags=' make backend
+```
+
+For easier stepping through unoptimized code with local source paths, use Go's
+quoting syntax for settings containing spaces:
+
+```bash
+GOFLAGS="-trimpath=false -ldflags= '-gcflags=all=-N -l'" make backend
+```
+
+These variables are inherited by desktop packaging hooks and embedded
+cross-compilation targets. `CC`, `CXX`, `CGO_CFLAGS`, `CGO_CXXFLAGS`, and
+`CGO_LDFLAGS` are passed through to Go unchanged when cgo is enabled; embedded
+cross-compilation targets continue to disable cgo.
+Generic C/C++ `CFLAGS` and `LDFLAGS` are not reinterpreted as Go options; use the
+Go and cgo variables above.
+The container build accepts `--build-arg GOFLAGS=...` and continues to use Go's
+unstripped defaults unless stripping is explicitly requested.
+
+CI exercises native Make/npm entrypoints on Linux, macOS, and Windows. Desktop
+packaging and a backend-only container build request
+`GOFLAGS='-trimpath=false -ldflags=-compressdwarf=false'`; the artifact verifier
+then checks the recorded flags and uncompressed DWARF entries in the resulting
+backend binaries, including packaged desktop resources.
+
 ## Backend token protection
 
 `HEADLAMP_BACKEND_TOKEN` enables a local trust boundary around protected backend
@@ -66,6 +111,17 @@ Imports and deletions lock the same recorded path, including symlinks.
 File updates precede in-memory removal, so failures keep the stored cluster.
 Memory-only deletion does not require file-mutation permission.
 
+## JSON request body limits
+
+Cluster add and rename, node drain, token-setting, and kubeconfig-parsing
+endpoints accept one JSON value with a maximum body size of 1 MiB, including
+trailing whitespace. Larger bodies return `413 Request Entity Too Large`;
+malformed JSON or additional JSON values return `400 Bad Request`.
+Unknown fields remain accepted for compatibility.
+
+The limit is local to these endpoints, not global middleware. Kubernetes
+API proxy requests are unchanged and can still forward larger manifests.
+
 ## Node drain authentication
 
 The frontend submits node drains and polls their status through
@@ -79,6 +135,50 @@ unsafe service-account mode was explicitly enabled. Drain does not implicitly
 fall back to the pod's service account or forward that credential to an external
 context. Legacy unscoped routes remain available for existing callers, but
 cookie-only browser clients should use the cluster-scoped routes.
+
+## Helm release history
+
+`GET /clusters/<cluster>/helm/release/history` requires non-empty `name` and
+`namespace` query parameters. Missing or empty values return `400 Bad Request`
+before Helm accesses the cluster. Valid requests retain the existing
+`{"releases": [...]}` response and release-lookup error handling.
+
+## Helm chart sources
+
+Helm install (`POST /clusters/<cluster>/helm/release/install`) and
+upgrade (`PUT /clusters/<cluster>/helm/releases/upgrade`) requests
+accept only a `chart` of the form
+`<repository>/<chart>`, where `<repository>` is a Helm repository
+registered with the backend through the repository routes. Other values
+are rejected with `400`: `http(s)` and `oci://` URLs, absolute and
+relative paths, and references that also exist as a path on the
+backend's filesystem. This only checks the `chart` value in the request,
+so a client cannot pass a chart URL or a local path. It does not limit
+which repository URLs can be registered, or the chart URLs listed in a
+repository's index; those are not covered by this check. Clients that
+installed charts from a direct URL must add the repository first and
+install from it.
+
+## Kubernetes response cache
+
+With `--cache-enabled`, users share resource responses within the same cluster
+connection. Each GET still checks the caller's permissions through a Kubernetes
+SelfSubjectAccessReview. Keys distinguish API versions, resources, namespaces,
+names, query parameters and the `Accept` representation. For example,
+`/api/v1/namespaces/team/pods/shared` and
+`/api/v1/namespaces/team/secrets/shared` never share an entry.
+
+A shared metadata list/watch invalidates each resource scope. It uses the
+connection's credentials when available, or a requesting user's token for a
+connection without stored credentials. Tokens are not saved to the context
+store. Until the watch is synchronized, and whenever it disconnects, requests go
+directly to Kubernetes. Authorization-check errors also bypass the cache.
+Watch events and writes invalidate both existing responses and pending fills;
+idle watches stop after ten minutes. Streaming, paginated, conditional, range,
+impersonated and subresource requests bypass the response cache, as do requests
+for a specific resource version or with `Cache-Control: no-cache`. Only successful
+Kubernetes objects are stored, and never responses that set cookies, send
+`Cache-Control: no-store` or vary on anything but `Accept` and `Accept-Encoding`.
 
 ## Telemetry
 
@@ -197,12 +297,11 @@ expiration.
 
 | Rank | Change | Expected memory effect | Trade-off |
 | --- | --- | --- | --- |
-| 1 | Store only object metadata in cache-invalidation informers | 70–99% of informer object heap, depending on resource payload size | Informer handlers cannot later consume spec or status without removing the transform |
-| 2 | Share cache-invalidation watchers for equivalent cluster connections | Avoids duplicated informer stores and goroutines for stateless users | Requires careful authentication and watcher lifecycle isolation |
-| 3 | Add byte and entry limits to the Kubernetes response cache | Prevents unbounded retained response growth and avoids caching oversized responses | Lower cache hit rate |
-| 4 | Cache only the Kubernetes authorization client instead of a full clientset | Removes unused typed clients from each token cache entry | Narrows the internal cache API |
-| 5 | Initialize proxy transports only when a context is first used | Saves per-context TLS and transport state for unused contexts | Adds synchronization to the first request |
-| 6 | Lower `GOGC` for the desktop backend | About 2–4.5 MiB in measured idle/request workloads | More frequent GC and modestly higher CPU use |
+| 1 | Share cache-invalidation watchers for equivalent cluster connections | Avoids duplicated informer stores and goroutines for stateless users | Requires careful authentication and watcher lifecycle isolation |
+| 2 | Add byte and entry limits to the Kubernetes response cache | Prevents unbounded retained response growth and avoids caching oversized responses | Lower cache hit rate |
+| 3 | Cache only the Kubernetes authorization client instead of a full clientset | Removes unused typed clients from each token cache entry | Narrows the internal cache API |
+| 4 | Initialize proxy transports only when a context is first used | Saves per-context TLS and transport state for unused contexts | Adds synchronization to the first request |
+| 5 | Lower `GOGC` for the desktop backend | About 2–4.5 MiB in measured idle/request workloads | More frequent GC and modestly higher CPU use |
 
 The desktop launcher defaults its bundled backend to `GOGC=25`, while preserving
 an explicitly configured `GOGC`. In isolated measurements, `GOGC=50` reduced

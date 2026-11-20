@@ -23,22 +23,34 @@ import Link from '@mui/material/Link';
 import { styled } from '@mui/material/styles';
 import { Dispatch, UnknownAction } from '@reduxjs/toolkit';
 import { useQuery } from '@tanstack/react-query';
-import { useEffect } from 'react';
+import { isEqual } from 'lodash';
+import { useEffect, useRef } from 'react';
 import { Trans, useTranslation } from 'react-i18next';
 import { useDispatch } from 'react-redux';
 import { useLocation } from 'react-router-dom';
+import {
+  getTrustedBackstageOrigins,
+  setRuntimeBackstageOrigins,
+  setupBackstageMessageReceiver,
+} from '../../helpers/backstageMessageReceiver';
+import { isBackstage } from '../../helpers/isBackstage';
 import { getCluster } from '../../lib/cluster';
 import { getSelectedClusters } from '../../lib/cluster';
 import { useCluster, useClustersConf, useSelectedClusters } from '../../lib/k8s';
 import { request } from '../../lib/k8s/api/v1/clusterRequests';
 import { Cluster } from '../../lib/k8s/cluster';
 import { getSavedNamespaces } from '../../lib/storage';
+import { getUserSelectedThemeName } from '../../lib/themes';
 import { setConfig } from '../../redux/configSlice';
 import { ConfigState } from '../../redux/configSlice';
 import { setNamespaceFilter } from '../../redux/filterSlice';
 import { useTypedSelector } from '../../redux/hooks';
 import store from '../../redux/stores/store';
 import { useUIPanelsGroupedBySide } from '../../redux/uiSlice';
+import { setAdminSettings } from '../../settings/adminSettingsSlice';
+import { useClusterDefinedSettings } from '../../settings/fetchClusterSettings';
+import { parseAdminSettings } from '../../settings/parseAdminSettings';
+import { useSetting } from '../../settings/useAdminSettings';
 import { fetchStatelessClusterKubeConfigs, isEqualClusterConfigs } from '../../stateless/';
 import { ActivitiesRenderer } from '../activity/Activity';
 import { ErrorPage, Loader } from '../common';
@@ -50,7 +62,7 @@ import AllowedNamespacesSelectorGate from './AllowedNamespacesSelectorGate';
 import ResourceShortcuts from './ResourceShortcuts';
 import RouteSwitcher from './RouteSwitcher';
 import ShortcutsSettings from './Settings/ShortcutsSettings';
-import { applyBackendThemeConfig } from './themeSlice';
+import { applyAdminTheme, applyBackendThemeConfig, useAppThemes } from './themeSlice';
 import TopBar from './TopBar';
 import VersionDialog from './VersionDialog';
 
@@ -141,27 +153,33 @@ declare global {
 const fetchConfig = (dispatch: Dispatch<UnknownAction>) => {
   const clusters = store.getState().config.clusters;
   const statelessClusters = store.getState().config.statelessClusters;
+  const currentBackstageOrigin = store.getState().config.backstageOrigin ?? '';
 
   return request('/config', { timeout: CONFIG_FETCH_TIMEOUT_MS }, false, false).then(config => {
     const clustersToConfig: ConfigState['clusters'] = {};
     config?.clusters.forEach((cluster: Cluster) => {
-      if (cluster.meta_data?.extensions?.headlamp_info?.customName) {
-        cluster.name = cluster.meta_data?.extensions?.headlamp_info?.customName;
-      }
       clustersToConfig[cluster.name] = cluster;
     });
 
+    const nextBackstageOrigin = config?.backstageOrigin ?? '';
+    setRuntimeBackstageOrigins(nextBackstageOrigin);
+
     const configToStore = {
       ...config,
+      clusterSources: config.clusterSources ?? [],
       clusters: clustersToConfig,
       oidcAutoLogin: config.oidcAutoLogin,
+      backstageOrigin: nextBackstageOrigin,
     };
 
     if (clusters === null) {
       dispatch(setConfig(configToStore));
     } else {
       // Check if the config is different
-      const configDifferent = isEqualClusterConfigs(clusters, clustersToConfig);
+      const configDifferent =
+        isEqualClusterConfigs(clusters, clustersToConfig) ||
+        currentBackstageOrigin !== nextBackstageOrigin ||
+        !isEqual(store.getState().config.clusterSources, configToStore.clusterSources);
 
       if (configDifferent) {
         // Merge the new config with the current config
@@ -177,6 +195,10 @@ const fetchConfig = (dispatch: Dispatch<UnknownAction>) => {
           })
         );
       }
+    }
+
+    if (config?.adminSettings) {
+      dispatch(setAdminSettings(parseAdminSettings(config.adminSettings)));
     }
 
     dispatch(
@@ -210,6 +232,31 @@ export default function Layout({}: LayoutProps) {
   const { t } = useTranslation();
   const allClusters = useClustersConf();
   const location = useLocation();
+
+  useClusterDefinedSettings();
+
+  // Bridge the admin theme to the active theme state. CLI forceTheme has
+  // precedence and is applied via applyBackendThemeConfig. A restricted admin
+  // theme always applies; otherwise the user's own pick wins and the admin
+  // theme is only the default.
+  const adminTheme = useSetting<string>('theme');
+  const appThemes = useAppThemes();
+  const forceTheme = useTypedSelector(state => state.config.forceTheme);
+  useEffect(() => {
+    if (forceTheme) {
+      return;
+    }
+    const restricted = adminTheme.disabled || adminTheme.hidden;
+    const target = restricted
+      ? adminTheme.value
+      : getUserSelectedThemeName(appThemes) ?? adminTheme.value;
+    if (target) {
+      dispatch(applyAdminTheme(target));
+    }
+    // appThemes is read only for the user's pick; theme registration alone must
+    // not re-apply the admin theme over what the user is looking at.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [adminTheme.value, adminTheme.disabled, adminTheme.hidden, forceTheme, dispatch]);
 
   /** This fetches the cluster config from the backend and updates the redux store on an interval.
    * When stateless clusters are enabled, it also fetches the stateless cluster config from the
@@ -248,6 +295,27 @@ export default function Layout({}: LayoutProps) {
       dispatch(setNamespaceFilter(saved));
     }
   }, [cluster, dispatch]);
+
+  const backstageOrigin = useTypedSelector(state => state.config.backstageOrigin);
+  const notifiedBackstageOriginsRef = useRef<Set<string>>(new Set());
+
+  useEffect(() => {
+    if (isBackstage()) {
+      return setupBackstageMessageReceiver();
+    }
+  }, []);
+
+  useEffect(() => {
+    if (isBackstage()) {
+      // Only announce readiness to configured, trusted Backstage origins.
+      getTrustedBackstageOrigins(backstageOrigin).forEach(origin => {
+        if (!notifiedBackstageOriginsRef.current.has(origin)) {
+          notifiedBackstageOriginsRef.current.add(origin);
+          window.parent.postMessage({ type: 'HEADLAMP_READY' }, origin);
+        }
+      });
+    }
+  }, [backstageOrigin]);
 
   const selectedClusters = useSelectedClusters();
   const { pathname } = location;
