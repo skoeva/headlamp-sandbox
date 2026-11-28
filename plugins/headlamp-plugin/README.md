@@ -74,6 +74,44 @@ API for linting, Storybook, and i18n extraction. See the
 [TypeScript setup and limitations](../../docs/development/plugins/getting-started.md#typescript-versions).
 Do not globally override `typescript` to version 7.
 
+## Scaffolding the coding agent harness
+
+`create` accepts an opt-in `--with-agent-skills` flag that adds a harness for
+building the plugin with a coding agent:
+
+```
+headlamp-plugin create my-plugin --with-agent-skills
+```
+
+The harness is vendor neutral: a plugin is shared, so it is set up for Claude
+Code, Codex and GitHub Copilot at once, and each contributor can use their own
+agent. It adds:
+
+- `AGENTS.md` — always-on agent rules for a Headlamp plugin (replaces the
+  default `AGENTS.md`). All three agents read it; `CLAUDE.md` imports it for
+  Claude Code.
+- Step-by-step [Agent Skills](https://agentskills.io) for the CNCF/CRD plugin
+  workflow (`create-cncf-plugin`, `plan-plugin`, `define-resource`,
+  `add-list-view`, `add-detail-view`, `add-settings`, `ensure-dependency`,
+  `seed-test-data`, `run-and-verify`, `document-plugin`), in `.claude/skills/`
+  for Claude Code and `.agents/skills/` for Codex. GitHub Copilot reads both.
+- MCP config for the `kubernetes`, `helm` and `chrome-devtools` servers the
+  skills use: `.mcp.json` (Claude Code, GitHub Copilot) and `.codex/config.toml`
+  (Codex, which reads it only in trusted projects).
+
+Without the flag, `create` behaves exactly as before.
+
+To add the harness to an **existing** plugin, pass the same flag to `upgrade`:
+
+```
+headlamp-plugin upgrade --with-agent-skills
+```
+
+Existing skills and agent config are left untouched, so it is safe to re-run;
+it prints which agent config files it kept and what to add to them.
+Like the default `AGENTS.md`, the harness `AGENTS.md` is kept in sync with the
+template by `upgrade`.
+
 ## Template for installing plugins from a configuration file
 
 plugins.yaml:
@@ -114,6 +152,53 @@ Run the fast compiler-selection and upgrade-policy tests with:
 ```bash
 npm run test:typescript
 ```
+
+Run the SDK-owned tooling tests and per-scope statement coverage with:
+
+```bash
+npm run test:tooling
+npm run test:coverage
+```
+
+The coverage command includes the existing compiler-selection and upgrade tests.
+The existing `test-headlamp-plugin.js` CI harness runs this command before its
+packed-consumer checks, retaining the separate Storybook mock contracts. Test
+files run sequentially to bound compiler/subprocess load without extending their
+individual timeouts.
+It requires **at least 80% statement coverage independently** for:
+
+- CLI code in `bin/headlamp-plugin.js` and `bin/typescript.js`.
+- The shipped Vite, i18next and Storybook configuration, including the TSX preview.
+- The JavaScript build-maintenance scripts and dependency synchronization.
+
+The exact file inventory is maintained in `test/helpers/coverage-scopes.cjs`.
+Unvisited files stay in the denominator. Copied frontend code, generated output,
+test harnesses, shipped test mocks, consumer templates and the generated MSW worker
+are not counted as production SDK tooling. The six TypeScript facade modules only
+reexport frontend bindings and contain no executable statements. The shell
+dependency-install wrapper is outside the JavaScript statement metric.
+
+Reports are written to `coverage/index.html`, `coverage/coverage-final.json`,
+`coverage/coverage-summary.json` and `coverage/scopes.json`. The command deletes
+its previous `coverage/` output before running and exits unsuccessfully if tests
+fail or any scope is below 80%, using the exact counters rather than a rounded
+percentage.
+
+These are offline behavior tests. They exercise real fixture files and CLI parsing;
+external npm/git/compiler/bundler operations are controlled at their API boundary
+to test failures and upgrade/watch decisions without changing installed packages,
+global npm links or user data. A separate real-process scenario verifies offline
+creation, extraction, packaging and archive checksums. CJS/ESM/TSX configuration is
+instrumented before the test-only module transformation so counters refer to the
+original source, and CLI child processes inherit collection.
+
+Collection-build regressions also run the real CLI and Vite against two distinct
+packages and verify each package's own bundle and Brotli output. Collection builds
+run sequentially because compilation temporarily changes the working directory.
+
+This command does not replace the real packed-consumer integration and TypeScript
+compatibility matrices described below, or the Storybook mock contracts. Those
+remain separate validation of the actual external tools.
 
 After building and packing the local tooling, run the standalone compatibility
 matrix (Node 24/npm 11) with:

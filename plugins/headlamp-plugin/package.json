@@ -7,7 +7,7 @@
   "bin": "bin/headlamp-plugin.js",
   "scripts": {
     "prepack": "(node -e \"if (! require('fs').existsSync('./lib/components')) {process.exit(1)} \" || (echo 'lib dir is empty. Remember to run `npm run build` before packing' && exit 1))",
-    "build": "npm run prepare-bundle && npx shx rm -rf lib types lib/assets lib/components lib/helpers lib/i18n lib/lib lib/plugin lib/redux lib/resources && npx shx cp -r ../../frontend/src/assets ../../frontend/src/components ../../frontend/src/helpers ../../frontend/src/stateless ../../frontend/src/i18n ../../frontend/src/lib ../../frontend/src/plugin ../../frontend/src/redux ../../frontend/src/resources src/ && tsc --build ./tsconfig.json && npx shx cp -r src/additional.d.ts lib/ && npx shx cp -r ../../frontend/src/assets lib/ && npx shx cp -r ../../frontend/src/resources lib/ && npx shx cp -r ../../frontend/src/i18n/locales lib/i18n && npx shx cp ../../frontend/src/i18n/i18nextSharedConfig.mjs ../../frontend/src/i18n/i18nextSharedConfig.d.mts lib/i18n && node scripts/copy-static-assets.js",
+    "build": "npm run prepare-bundle && npx shx rm -rf lib types lib/assets lib/components lib/helpers lib/i18n lib/lib lib/plugin lib/redux lib/resources lib/settings && npx shx cp -r ../../frontend/src/assets ../../frontend/src/components ../../frontend/src/helpers ../../frontend/src/stateless ../../frontend/src/i18n ../../frontend/src/lib ../../frontend/src/plugin ../../frontend/src/redux ../../frontend/src/resources ../../frontend/src/settings src/ && tsc --build ./tsconfig.json && npx shx cp -r src/additional.d.ts lib/ && npx shx cp -r ../../frontend/src/assets lib/ && npx shx cp -r ../../frontend/src/resources lib/ && npx shx cp -r ../../frontend/src/i18n/locales lib/i18n && npx shx cp ../../frontend/src/i18n/i18nextSharedConfig.mjs ../../frontend/src/i18n/i18nextSharedConfig.d.mts lib/i18n && node scripts/copy-static-assets.js",
     "bundle-examples": "node scripts/bundle-examples.js",
     "fetch-official-plugins": "node scripts/fetch-official-plugins.js",
     "prepare-bundle": "npm run bundle-examples && npm run fetch-official-plugins",
@@ -15,6 +15,8 @@
     "test:typescript:compatibility": "node test-typescript-compatibility.js",
     "test:storybook-mocks": "vitest run -c config/vite.config.mjs storybookBaseMocks.test.ts",
     "test:upgrade": "node --test test-upgrade.js",
+    "test:tooling": "node --test test/*.test.cjs",
+    "test:coverage": "node scripts/test-coverage.cjs",
     "update-dependencies": "node dependencies-sync.js update && npm install && node scripts/copy-package-lock.js",
     "check-dependencies": "node dependencies-sync.js check",
     "copy-package-lock": "node scripts/copy-package-lock.js"
@@ -128,6 +130,13 @@
     "yaml": "^2.7.0",
     "yargs": "^17.7.2"
   },
+  "devDependencies": {
+    "esbuild": "^0.25.12",
+    "istanbul-lib-coverage": "^3.2.2",
+    "istanbul-lib-instrument": "^6.0.3",
+    "istanbul-lib-report": "^3.0.1",
+    "istanbul-reports": "^3.2.0"
+  },
   "overrides": {
     "axe-core": "npm:dry-uninstall",
     "nth-check": "2.0.1",
@@ -140,6 +149,7 @@
     "bin",
     "config",
     "template",
+    "template-agents",
     "lib",
     "types",
     ".storybook",

@@ -24,6 +24,7 @@ This tests unpublished @kinvolk/headlamp-plugin package in repo.
 Assumes being run within the plugins/headlamp-plugin folder
 `;
 const PACKAGE_NAME = 'headlamp-myfancy';
+const AGENTS_PACKAGE_NAME = 'headlamp-myfancy-agents';
 
 function testHeadlampPlugin() {
   // remove some temporary files.
@@ -33,9 +34,8 @@ function testHeadlampPlugin() {
 
   // Make a package file of headlamp-plugin we can test
   run('npm', ['install']);
-  run('npm', ['run', 'test:typescript']);
+  run('npm', ['run', 'test:coverage']);
   run('npm', ['run', 'test:storybook-mocks']);
-  run('npm', ['run', 'test:upgrade']);
   run('npm', ['run', 'build']);
   checkFileContains(join('lib', 'index.js'), 'DefaultCreateProject');
   checkFileContains(join('lib', 'index.d.ts'), 'DefaultCreateProject');
@@ -142,6 +142,59 @@ function testHeadlampPlugin() {
   run('npm', ['run', 'lint']);
   run('npm', ['run', 'lint-fix']);
 
+  // Regression test for #7036: plugin modules that import a *value* (not just
+  // a type) from `@kinvolk/headlamp-plugin/lib/[Kk]8s/*` must resolve at test
+  // time. The published tree has an extra `lib/` prefix (source at
+  // `src/lib/**` emits to `lib/lib/**`), so without a resolve alias in the
+  // plugin's vite config, vitest can't load the module and fails at
+  // transform time. The test imports from `lib/[Kk]8s/patchUtils`, a leaf
+  // module whose only runtime dependencies are external (`lodash`,
+  // `fast-json-patch`). Importing from a file that transitively loads the
+  // whole k8s class hierarchy surfaces an unrelated pre-existing
+  // class-extends ordering issue in the compiled plugin lib; using a leaf
+  // keeps the test scoped to what this PR actually fixes: resolvability.
+  const libImportTestPath = join(curDir, 'src', '__lib-import.test.ts');
+  fs.writeFileSync(
+    libImportTestPath,
+    `import { describe, expect, it } from 'vitest';
+import { computePatchOperations as fnLower } from '@kinvolk/headlamp-plugin/lib/k8s/patchUtils';
+import { computePatchOperations as fnUpper } from '@kinvolk/headlamp-plugin/lib/K8s/patchUtils';
+
+describe('plugin lib/[Kk]8s value imports', () => {
+  it('resolves a value via the lowercase path at test time', () => {
+    expect(fnLower).toBeDefined();
+    expect(typeof fnLower).toBe('function');
+  });
+  it('resolves a value via the uppercase path at test time', () => {
+    expect(fnUpper).toBeDefined();
+    expect(typeof fnUpper).toBe('function');
+  });
+  it('reaches the same underlying binding through both casings', () => {
+    expect(fnLower).toBe(fnUpper);
+  });
+});
+`
+  );
+  // `headlamp-plugin test` launches vitest without a single-run flag, and
+  // vitest only skips watch mode when it detects CI. Force CI for this one
+  // invocation so the script doesn't hang in watch mode when run locally.
+  const prevCI = process.env.CI;
+  process.env.CI = 'true';
+  try {
+    run('npm', ['run', 'test']);
+  } finally {
+    if (prevCI === undefined) {
+      delete process.env.CI;
+    } else {
+      process.env.CI = prevCI;
+    }
+    // Remove the fixture whether the test passed or failed, so a failed run
+    // doesn't leak the test file into the working tree.
+    if (fs.existsSync(libImportTestPath)) {
+      fs.rmSync(libImportTestPath);
+    }
+  }
+
   // test type script error checks
   run('npm', ['run', 'tsc']);
 
@@ -224,6 +277,69 @@ export const Default: Story = {};
   if (fs.readFileSync(indexTsxPath, 'utf8').includes('@material-ui')) {
     exit(`Error: @material-ui imports in ${indexTsxPath}`);
   }
+
+  // test "create --with-agent-skills" scaffolds the harness for every supported agent.
+  curDir = '.';
+  const harnessAgentsMd = fs.readFileSync(join('template-agents', 'AGENTS.md'), 'utf8');
+  const checkHarnessAgentsMd = () => {
+    if (fs.readFileSync(join(AGENTS_PACKAGE_NAME, 'AGENTS.md'), 'utf8') !== harnessAgentsMd) {
+      exit(`Error: ${AGENTS_PACKAGE_NAME}/AGENTS.md is not the harness AGENTS.md.`);
+    }
+  };
+  fs.rmSync(AGENTS_PACKAGE_NAME, { recursive: true, force: true });
+  run('node', [
+    'bin/headlamp-plugin.js',
+    'create',
+    AGENTS_PACKAGE_NAME,
+    '--link',
+    '--noinstall',
+    '--with-agent-skills',
+  ]);
+  checkHarnessAgentsMd();
+  checkFileContains(join(AGENTS_PACKAGE_NAME, 'CLAUDE.md'), '@AGENTS.md');
+  checkFileExists(join(AGENTS_PACKAGE_NAME, '.mcp.json'));
+  checkFileContains(
+    join(AGENTS_PACKAGE_NAME, '.claude', 'skills', 'create-cncf-plugin', 'SKILL.md'),
+    'allowed-tools:'
+  );
+  checkFileExists(join(AGENTS_PACKAGE_NAME, '.codex', 'config.toml'));
+  const codexSkill = join(
+    AGENTS_PACKAGE_NAME,
+    '.agents',
+    'skills',
+    'create-cncf-plugin',
+    'SKILL.md'
+  );
+  checkFileExists(codexSkill);
+  // The .agents/skills copy of each skill drops the Claude-specific allowed-tools frontmatter.
+  if (fs.readFileSync(codexSkill, 'utf8').match(/^allowed-tools:/m)) {
+    exit(`Error: ${codexSkill} still has allowed-tools frontmatter.`);
+  }
+  // The default scaffold must NOT include the harness.
+  checkFileDoesNotExist(join(PACKAGE_NAME, 'CLAUDE.md'));
+  checkFileDoesNotExist(join(PACKAGE_NAME, '.agents'));
+  fs.rmSync(AGENTS_PACKAGE_NAME, { recursive: true, force: true });
+
+  // test "upgrade --with-agent-skills" opts a default plugin into the harness,
+  // replacing the default AGENTS.md.
+  run('node', ['bin/headlamp-plugin.js', 'create', AGENTS_PACKAGE_NAME, '--link', '--noinstall']);
+  run('node', [
+    'bin/headlamp-plugin.js',
+    'upgrade',
+    AGENTS_PACKAGE_NAME,
+    '--skip-package-updates',
+    '--with-agent-skills',
+  ]);
+  checkHarnessAgentsMd();
+  checkFileExists(join(AGENTS_PACKAGE_NAME, '.agents', 'skills', 'plan-plugin', 'SKILL.md'));
+  checkFileExists(join(AGENTS_PACKAGE_NAME, '.claude', 'skills', 'plan-plugin', 'SKILL.md'));
+  checkFileExists(join(AGENTS_PACKAGE_NAME, '.codex', 'config.toml'));
+  checkFileExists(join(AGENTS_PACKAGE_NAME, 'CLAUDE.md'));
+  // a plain upgrade keeps the harness AGENTS.md rather than resetting it to the default.
+  fs.rmSync(join(AGENTS_PACKAGE_NAME, 'AGENTS.md'));
+  run('node', ['bin/headlamp-plugin.js', 'upgrade', AGENTS_PACKAGE_NAME, '--skip-package-updates']);
+  checkHarnessAgentsMd();
+  fs.rmSync(AGENTS_PACKAGE_NAME, { recursive: true, force: true });
 }
 
 const fs = require('fs');
@@ -240,7 +356,7 @@ function cleanup() {
     .filter(file => file.match('kinvolk-headlamp-plugin-.*gz'))
     .forEach(file => fs.rmSync(file));
 
-  const foldersToRemove = [path.join('.plugins', PACKAGE_NAME), PACKAGE_NAME];
+  const foldersToRemove = [path.join('.plugins', PACKAGE_NAME), PACKAGE_NAME, AGENTS_PACKAGE_NAME];
   console.log('Temp foldersToRemove', foldersToRemove);
   foldersToRemove
     .filter(folder => fs.existsSync(folder))
@@ -345,6 +461,11 @@ function checkTemplateLockHasNoPluginIntegrity() {
     exit(`Error: ${lockPath} pins an integrity for @kinvolk/headlamp-plugin.`);
   }
   console.log('✓ template package-lock.json has no integrity for @kinvolk/headlamp-plugin');
+}
+function checkFileDoesNotExist(fname) {
+  if (fs.existsSync(fname)) {
+    exit(`Error: ${fname} exists but should not.`);
+  }
 }
 function exit(message) {
   console.error(message);

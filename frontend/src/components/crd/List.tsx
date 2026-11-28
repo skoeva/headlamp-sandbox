@@ -18,6 +18,7 @@ import React from 'react';
 import { useTranslation } from 'react-i18next';
 import CRD from '../../lib/k8s/crd';
 import { Link, useThrottle } from '../common';
+import { EmptyStateActions } from '../common/Resource/EmptyStateActions';
 import ResourceListView from '../common/Resource/ResourceListView';
 
 export default function CustomResourceDefinitionList() {
@@ -46,6 +47,7 @@ export default function CustomResourceDefinitionList() {
         noNamespaceFilter: true,
       }}
       data={throttledItems}
+      emptyActions={<EmptyStateActions />}
       errorMessage={CRD.getErrorMessage(error)}
       columns={[
         {
@@ -84,12 +86,12 @@ export default function CustomResourceDefinitionList() {
         {
           label: t('translation|Group'),
           filterVariant: 'multi-select',
-          getValue: crd => crd.spec.group,
+          getValue: crd => crd.spec?.group ?? '',
         },
         {
           label: t('Scope'),
           filterVariant: 'multi-select',
-          getValue: crd => crd.spec.scope,
+          getValue: crd => crd.spec?.scope ?? '',
         },
         {
           label: t('translation|Categories'),

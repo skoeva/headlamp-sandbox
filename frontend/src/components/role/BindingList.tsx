@@ -21,12 +21,38 @@ import RoleBinding from '../../lib/k8s/roleBinding';
 import { useNamespaces } from '../../redux/filterSlice';
 import LabelListItem from '../common/LabelListItem';
 import Link from '../common/Link';
+import { EmptyStateActions } from '../common/Resource/EmptyStateActions';
 import ResourceListView from '../common/Resource/ResourceListView';
+import { LightTooltip } from '../common/Tooltip';
 
-function RoleLink(props: { role: string; namespace?: string; cluster: string }) {
-  const { role, namespace, cluster } = props;
+/** Compares two bindings by the names of their subjects of the given kind (e.g. 'User', 'Group', 'ServiceAccount'). */
+export function sortBindingsByKind(kind: string) {
+  return function (r1: RoleBinding, r2: RoleBinding) {
+    const groups1 = r1?.subjects
+      ?.filter(subject => subject.kind === kind)
+      .map(subject => subject.name);
+    const groups2 = r2?.subjects
+      ?.filter(subject => subject.kind === kind)
+      .map(subject => subject.name);
+    if (groups1 && groups2) {
+      return groups1.join('').localeCompare(groups2.join(''));
+    } else if (groups1) {
+      return 1;
+    } else if (groups2) {
+      return -1;
+    } else {
+      return 0;
+    }
+  };
+}
 
-  if (namespace) {
+function RoleLink(props: { role: string; kind: string; namespace?: string; cluster: string }) {
+  const { role, kind, namespace, cluster } = props;
+
+  // A RoleBinding can reference a namespaced Role or a cluster-scoped
+  // ClusterRole, so route by roleRef.kind; only a Role lives in the
+  // binding's namespace.
+  if (kind === 'Role' && namespace) {
     return (
       <Link routeName="role" params={{ name: role, namespace }} activeCluster={cluster} tooltip>
         {role}
@@ -38,6 +64,42 @@ function RoleLink(props: { role: string; namespace?: string; cluster: string }) 
     <Link routeName="clusterrole" params={{ name: role }} activeCluster={cluster} tooltip>
       {role}
     </Link>
+  );
+}
+
+function ServiceAccountList(props: { binding: RoleBinding }) {
+  const { binding } = props;
+  const subjects = binding.subjects?.filter(subject => subject.kind === 'ServiceAccount') ?? [];
+
+  if (subjects.length === 0) {
+    return null;
+  }
+
+  return (
+    <LightTooltip title={subjects.map(subject => subject.name).join('\n')} interactive>
+      <span>
+        {subjects.map((subject, index) => {
+          const namespace = subject.namespace || binding.getNamespace();
+
+          return (
+            <React.Fragment key={`${subject.name}__${index}`}>
+              {index > 0 && ', '}
+              {namespace ? (
+                <Link
+                  routeName="serviceAccount"
+                  params={{ name: subject.name, namespace }}
+                  activeCluster={binding.cluster}
+                >
+                  {subject.name}
+                </Link>
+              ) : (
+                subject.name
+              )}
+            </React.Fragment>
+          );
+        })}
+      </span>
+    </LightTooltip>
   );
 }
 
@@ -64,30 +126,12 @@ export default function RoleBindingList() {
     return [...(roleErrors ?? []), ...(clusterRoleErrors ?? [])];
   }, [roleErrors, clusterRoleErrors]);
 
-  function sortBindings(kind: string) {
-    return function (r1: RoleBinding, r2: RoleBinding) {
-      const groups1 = r1?.subjects
-        ?.filter(subject => subject.kind === kind)
-        .map(subject => subject.name);
-      const groups2 = r2?.subjects
-        ?.filter(subject => subject.kind === kind)
-        .map(subject => subject.name);
-      if (groups1 && groups2) {
-        return groups1.join('').localeCompare(groups2.join(''));
-      } else if (groups1) {
-        return 1;
-      } else if (groups2) {
-        return -1;
-      } else {
-        return 0;
-      }
-    };
-  }
-
   return (
     <ResourceListView
       title={t('glossary|Role Bindings')}
+      headerProps={{ noNamespaceFilter: false }}
       errors={allErrors}
+      emptyActions={<EmptyStateActions />}
       columns={[
         'type',
         'name',
@@ -116,6 +160,7 @@ export default function RoleBindingList() {
           render: item => (
             <RoleLink
               role={item.roleRef.name}
+              kind={item.roleRef.kind}
               namespace={item.getNamespace()}
               cluster={item.cluster}
             />
@@ -138,7 +183,7 @@ export default function RoleBindingList() {
               }
             />
           ),
-          sort: sortBindings('User'),
+          sort: sortBindingsByKind('User'),
         },
         {
           id: 'groups',
@@ -157,7 +202,7 @@ export default function RoleBindingList() {
               }
             />
           ),
-          sort: sortBindings('Group'),
+          sort: sortBindingsByKind('Group'),
         },
         {
           id: 'serviceaccounts',
@@ -167,16 +212,8 @@ export default function RoleBindingList() {
               ?.filter(subject => subject.kind === 'ServiceAccount')
               ?.map(subject => subject.name)
               ?.join(' '),
-          render: item => (
-            <LabelListItem
-              labels={
-                item?.subjects
-                  ?.filter(subject => subject.kind === 'ServiceAccount')
-                  .map(subject => subject.name) || []
-              }
-            />
-          ),
-          sort: sortBindings('Service Accounts'),
+          render: item => <ServiceAccountList binding={item} />,
+          sort: sortBindingsByKind('ServiceAccount'),
         },
         'labels',
         'age',

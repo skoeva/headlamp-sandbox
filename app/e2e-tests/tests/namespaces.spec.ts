@@ -22,6 +22,8 @@ import path from 'path';
 import { _electron, Page } from 'playwright';
 import { HeadlampPage } from './headlampPage';
 import { NamespacesPage } from './namespacesPage';
+import { dismissReleaseNotes } from './releaseNotesTestUtils';
+import { dismissWelcome } from './welcome';
 
 const electronExecutable = process.platform === 'win32' ? 'electron.cmd' : 'electron';
 const electronPath = path.resolve(__dirname, `../../node_modules/.bin/${electronExecutable}`);
@@ -37,6 +39,7 @@ const electron = _electron;
 const appPath = path.resolve(__dirname, '../../');
 let electronApp;
 let electronPage: Page;
+let profileDir: string;
 
 test.beforeAll(async () => {
   fs.writeFileSync(
@@ -46,11 +49,12 @@ test.beforeAll(async () => {
     }),
     { mode: 0o600 }
   );
+  profileDir = fs.mkdtempSync(path.join(os.tmpdir(), 'headlamp-e2e-namespaces-profile-'));
 
   electronApp = await electron.launch({
     cwd: appPath,
     executablePath: electronPath,
-    args: ['.'],
+    args: ['.', `--user-data-dir=${profileDir}`],
     env: {
       ...process.env,
       NODE_ENV: 'development',
@@ -59,7 +63,8 @@ test.beforeAll(async () => {
     },
   });
 
-  electronPage = await electronApp.firstWindow();
+  electronPage = await dismissReleaseNotes(electronApp);
+  await dismissWelcome(electronPage);
 });
 
 // The app holds a single-instance lock, so it must be closed or a later
@@ -67,6 +72,9 @@ test.beforeAll(async () => {
 test.afterAll(async () => {
   await electronApp?.close();
   fs.rmSync(ISOLATED_KUBECONFIG, { force: true });
+  if (profileDir) {
+    fs.rmSync(profileDir, { recursive: true, force: true });
+  }
 });
 
 // note: this test is for local app development testing and requires a
@@ -108,6 +116,13 @@ test.describe('create a namespace with the minimal editor', async () => {
     await minimalEditorSwitch.check();
     const editor = page.getByRole('textbox', { name: 'yaml Code' });
 
+    const originalBounds = await electronApp.evaluate(({ BrowserWindow }) => {
+      const window = BrowserWindow.getAllWindows()[0];
+      const bounds = window.getBounds();
+      window.setContentSize(1280, 960);
+      return bounds;
+    });
+
     try {
       await electronApp.evaluate(({ BrowserWindow }) => {
         BrowserWindow.getAllWindows()[0]?.webContents.setZoomFactor(2);
@@ -123,9 +138,11 @@ test.describe('create a namespace with the minimal editor', async () => {
       await applyButton.click();
       await page.waitForSelector(`text=Applied ${name}`);
     } finally {
-      await electronApp.evaluate(({ BrowserWindow }) => {
-        BrowserWindow.getAllWindows()[0]?.webContents.setZoomFactor(1);
-      });
+      await electronApp.evaluate(({ BrowserWindow }, bounds) => {
+        const window = BrowserWindow.getAllWindows()[0];
+        window.webContents.setZoomFactor(1);
+        window.setBounds(bounds);
+      }, originalBounds);
     }
 
     await namespacesPage.deleteNamespace(name);

@@ -249,7 +249,7 @@ api.example.com"
                     role="status"
                   />
                   <div
-                    class="MuiPaper-root MuiPaper-outlined MuiPaper-rounded MuiTableContainer-root css-1sjkwtf-MuiPaper-root-MuiTableContainer-root"
+                    class="MuiPaper-root MuiPaper-outlined MuiPaper-rounded MuiTableContainer-root css-17ygbib-MuiPaper-root-MuiTableContainer-root"
                     tabindex="0"
                   >
                     <table
@@ -333,7 +333,7 @@ api.example.com"
                     role="status"
                   />
                   <div
-                    class="MuiPaper-root MuiPaper-outlined MuiPaper-rounded MuiTableContainer-root css-1sjkwtf-MuiPaper-root-MuiTableContainer-root"
+                    class="MuiPaper-root MuiPaper-outlined MuiPaper-rounded MuiTableContainer-root css-17ygbib-MuiPaper-root-MuiTableContainer-root"
                     tabindex="0"
                   >
                     <table
@@ -440,11 +440,11 @@ api.example.com"
                     role="status"
                   />
                   <div
-                    class="MuiPaper-root MuiPaper-outlined MuiPaper-rounded MuiTableContainer-root css-1sjkwtf-MuiPaper-root-MuiTableContainer-root"
+                    class="MuiPaper-root MuiPaper-outlined MuiPaper-rounded MuiTableContainer-root css-17ygbib-MuiPaper-root-MuiTableContainer-root"
                     tabindex="0"
                   >
                     <table
-                      class="MuiTable-root css-4d0x9t-MuiTable-root"
+                      class="MuiTable-root css-1itiqyv-MuiTable-root"
                     >
                       <thead
                         class="MuiTableHead-root css-15wwp11-MuiTableHead-root"
@@ -458,6 +458,12 @@ api.example.com"
                           >
                             Filter Type
                           </th>
+                          <th
+                            class="MuiTableCell-root MuiTableCell-head MuiTableCell-sizeSmall css-l4jzay-MuiTableCell-root"
+                            scope="col"
+                          >
+                            Configuration
+                          </th>
                         </tr>
                       </thead>
                       <tbody
@@ -470,6 +476,15 @@ api.example.com"
                             class="MuiTableCell-root MuiTableCell-body MuiTableCell-sizeSmall css-oh2q4q-MuiTableCell-root"
                           >
                             RequestHeaderModifier
+                          </td>
+                          <td
+                            class="MuiTableCell-root MuiTableCell-body MuiTableCell-sizeSmall css-oh2q4q-MuiTableCell-root"
+                          >
+                            <span
+                              class="MuiTypography-root MuiTypography-body2 css-10pa9y4-MuiTypography-root"
+                            >
+                              —
+                            </span>
                           </td>
                         </tr>
                       </tbody>
@@ -495,7 +510,7 @@ api.example.com"
                     role="status"
                   />
                   <div
-                    class="MuiPaper-root MuiPaper-outlined MuiPaper-rounded MuiTableContainer-root css-1sjkwtf-MuiPaper-root-MuiTableContainer-root"
+                    class="MuiPaper-root MuiPaper-outlined MuiPaper-rounded MuiTableContainer-root css-17ygbib-MuiPaper-root-MuiTableContainer-root"
                     tabindex="0"
                   >
                     <table
@@ -633,7 +648,7 @@ api.example.com"
                 role="status"
               />
               <div
-                class="MuiPaper-root MuiPaper-outlined MuiPaper-rounded MuiTableContainer-root css-onzayo-MuiPaper-root-MuiTableContainer-root"
+                class="MuiPaper-root MuiPaper-outlined MuiPaper-rounded MuiTableContainer-root css-3v2uip-MuiPaper-root-MuiTableContainer-root"
                 tabindex="0"
               >
                 <table

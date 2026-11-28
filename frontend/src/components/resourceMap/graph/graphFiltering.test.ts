@@ -15,6 +15,7 @@
  */
 
 import App from '../../../App';
+import CertificateSigningRequest from '../../../lib/k8s/certificateSigningRequest';
 import { KubeMetadata } from '../../../lib/k8s/KubeMetadata';
 import Pod from '../../../lib/k8s/pod';
 import { filterGraph, filterGraphIncremental, GraphFilter } from './graphFiltering';
@@ -23,6 +24,67 @@ import { GraphEdge, GraphNode } from './graphModel';
 // circular dependency fix
 // eslint-disable-next-line no-unused-vars
 const _dont_delete_me = App;
+
+describe('filtering through shared resources', () => {
+  const node = (
+    id: string,
+    namespace?: string,
+    status: GraphNode['status'] = 'success'
+  ): GraphNode => ({
+    id,
+    status,
+    kubeObject: { kind: 'Test', metadata: { name: id, namespace } } as any,
+  });
+
+  // Two projects use the same DeviceClass, and two Pods share one ResourceClaimTemplate.
+  const nodes = [
+    node('pod-a', 'a', 'error'),
+    node('claim-a', 'a'),
+    node('pod-b', 'b'),
+    node('claim-b', 'b'),
+    node('pod-a2', 'a'),
+    node('template-a', 'a'),
+    node('class'),
+  ];
+  const edges: GraphEdge[] = [
+    { id: 'e1', source: 'pod-a', target: 'claim-a' },
+    { id: 'e2', source: 'claim-a', target: 'class', nonGroupingSide: 'target' },
+    { id: 'e3', source: 'pod-b', target: 'claim-b' },
+    { id: 'e4', source: 'claim-b', target: 'class', nonGroupingSide: 'target' },
+    { id: 'e5', source: 'pod-a', target: 'template-a', nonGroupingSide: 'target' },
+    { id: 'e6', source: 'pod-a2', target: 'template-a', nonGroupingSide: 'target' },
+    { id: 'e7', source: 'template-a', target: 'class', nonGroupingSide: 'both' },
+  ];
+  const ids = (result: { nodes: GraphNode[] }) => result.nodes.map(node => node.id).sort();
+
+  it('keeps a project from pulling in another project through a shared class', () => {
+    const result = filterGraph(nodes, edges, [{ type: 'namespace', namespaces: new Set(['a']) }]);
+
+    expect(ids(result)).toEqual(['claim-a', 'class', 'pod-a', 'pod-a2', 'template-a']);
+  });
+
+  it('keeps healthy workloads out when they only share a class or template', () => {
+    const result = filterGraph(nodes, edges, [{ type: 'hasErrors' }]);
+
+    expect(ids(result)).toEqual(['claim-a', 'class', 'pod-a', 'template-a']);
+    expect(result.edges.map(edge => edge.id).sort()).toEqual(['e1', 'e2', 'e5', 'e7']);
+  });
+
+  it('stops at shared resources in incremental updates too', () => {
+    const result = filterGraphIncremental(
+      [],
+      [],
+      new Set(['pod-a']),
+      new Set(),
+      new Set(),
+      nodes,
+      edges,
+      [{ type: 'hasErrors' }]
+    );
+
+    expect(ids(result)).toEqual(['claim-a', 'class', 'pod-a', 'template-a']);
+  });
+});
 
 describe('filterGraph', () => {
   const nodes: GraphNode[] = [
@@ -124,6 +186,34 @@ describe('filterGraph', () => {
     const { nodes: filteredNodes } = filterGraph(customNodes, [], [{ type: 'hasErrors' }]);
 
     expect(filteredNodes.map(it => it.id)).toEqual(['warning-node', 'error-node']);
+  });
+
+  it('keeps pending, denied, and failed certificate requests in the problems filter', () => {
+    const csrNode = (
+      id: string,
+      conditions: Array<{ type: string; status: string }>
+    ): GraphNode => ({
+      id,
+      kubeObject: new CertificateSigningRequest({
+        apiVersion: 'certificates.k8s.io/v1',
+        kind: 'CertificateSigningRequest',
+        metadata: { uid: id, name: id },
+        spec: { request: '', signerName: 'example.com/signer' },
+        status: { conditions },
+      } as any),
+    });
+    const csrs = [
+      csrNode('pending', []),
+      csrNode('denied', [{ type: 'Denied', status: 'True' }]),
+      csrNode('failed', [{ type: 'Failed', status: 'True' }]),
+      csrNode('approved', [{ type: 'Approved', status: 'True' }]),
+    ];
+
+    expect(filterGraph(csrs, [], [{ type: 'hasErrors' }]).nodes.map(node => node.id)).toEqual([
+      'pending',
+      'denied',
+      'failed',
+    ]);
   });
 
   it('includes nodes related to explicit status matches', () => {

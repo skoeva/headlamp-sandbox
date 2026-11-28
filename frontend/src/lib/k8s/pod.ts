@@ -18,7 +18,7 @@ import { Base64 } from 'js-base64';
 import { patch, post } from './api/v1/clusterRequests';
 import type { StreamArgs, StreamResultsCb } from './api/v1/streamingApi';
 import { stream } from './api/v1/streamingApi';
-import type { KubeCondition, KubeContainer, KubeContainerStatus, Time } from './cluster';
+import type { KubeContainer, KubeContainerStatus, PodCondition, Time } from './cluster';
 import type { KubeObjectInterface } from './KubeObject';
 import { KubeObject } from './KubeObject';
 import type { WorkloadHealthCategory } from './Workload';
@@ -89,6 +89,8 @@ export interface KubePodSpec {
   priority?: number;
   priorityClassName?: string;
   runtimeClassName?: string;
+  /** Resources reserved for the pod sandbox, populated from its RuntimeClass at admission. */
+  overhead?: Record<string, string>;
   terminationGracePeriodSeconds?: number;
   tolerations?: any[];
   restartPolicy?: string;
@@ -105,7 +107,7 @@ export interface KubePodSpec {
 export interface KubePod extends KubeObjectInterface {
   spec: KubePodSpec;
   status: {
-    conditions: KubeCondition[];
+    conditions: PodCondition[];
     containerStatuses: KubeContainerStatus[];
     initContainerStatuses?: KubeContainerStatus[];
     ephemeralContainerStatuses?: KubeContainerStatus[];
@@ -131,6 +133,8 @@ export interface ExecOptions extends StreamArgs {
 export interface LogOptions {
   /** The number of lines to display from the end side of the log */
   tailLines?: number;
+  /** Only return logs newer than this many seconds. Leave unset to not limit by time. */
+  sinceSeconds?: number;
   /** Whether to show the logs from previous runs of the container (only for restarted containers) */
   showPrevious?: boolean;
   /** Whether to show the timestamps in the logs */
@@ -261,6 +265,7 @@ class Pod extends KubeObject<KubePod> {
     const [container, onLogs, logsOptions] = args as Parameters<newGetLogs>;
     const {
       tailLines = 100,
+      sinceSeconds,
       showPrevious = false,
       showTimestamps = false,
       follow = true,
@@ -271,12 +276,18 @@ class Pod extends KubeObject<KubePod> {
 
     let logs: string[] = [];
     let hasJsonLogs = false;
+    let pending = '';
+    let decoder = new TextDecoder();
     let url = `/api/v1/namespaces/${this.getNamespace()}/pods/${this.getName()}/log?container=${container}&previous=${showPrevious}&timestamps=${showTimestamps}&follow=${follow}`;
 
     // Negative tailLines parameter fetches all logs. If it's non negative it fetches
     // the tailLines number of logs.
     if (tailLines !== -1) {
       url += `&tailLines=${tailLines}`;
+    }
+
+    if (sinceSeconds !== undefined && sinceSeconds > 0) {
+      url += `&sinceSeconds=${sinceSeconds}`;
     }
 
     function unescapeStringLiterals(str: string): string {
@@ -318,16 +329,40 @@ class Pod extends KubeObject<KubePod> {
       }
     }
 
+    function pushLine(line: string) {
+      const jsonMatch = line.trim().match(/(\{.*\})/);
+      if (jsonMatch) hasJsonLogs = true;
+      logs.push(hasJsonLogs && prettifyLogs ? prettifyLogLine(line) : line);
+    }
+
+    function flushPending() {
+      pending += decoder.decode();
+
+      if (pending === '') return;
+
+      pushLine(pending);
+      pending = '';
+      onLogs({ logs, hasJsonLogs });
+    }
+
     function onResults(item: string) {
       if (!item) return;
 
-      const decodedLog = Base64.decode(item);
-      if (!decodedLog || decodedLog.trim() === '') return;
-      const trimmedLog = decodedLog.trim();
-      const jsonMatch = trimmedLog.match(/(\{.*\})/);
-      if (jsonMatch) hasJsonLogs = true;
-      const processedLog = hasJsonLogs && prettifyLogs ? prettifyLogLine(decodedLog) : decodedLog;
-      logs.push(processedLog);
+      // Decode as a stream: the backend base64-encodes each message on its own, so a
+      // multibyte character can be split across two of them.
+      const decodedLog = decoder.decode(Base64.toUint8Array(item), { stream: true });
+      if (!decodedLog) return;
+
+      const chunks = decodedLog.split('\n');
+      const unfinishedLine = chunks.pop() ?? '';
+
+      if (chunks.length > 0) {
+        chunks[0] = pending + chunks[0];
+        pending = '';
+        chunks.forEach(chunk => pushLine(`${chunk}\n`));
+      }
+
+      pending += unfinishedLine;
       onLogs({ logs, hasJsonLogs });
     }
 
@@ -337,6 +372,8 @@ class Pod extends KubeObject<KubePod> {
       connectCb: () => {
         logs = [];
         hasJsonLogs = false;
+        pending = '';
+        decoder = new TextDecoder();
       },
       /**
        * This callback is called when the connection is closed. It then check
@@ -344,6 +381,8 @@ class Pod extends KubeObject<KubePod> {
        * due to an error, it stops further reconnection attempts.
        */
       failCb: () => {
+        flushPending();
+
         // If it's a reconnection attempt, stop further reconnection attempts
         if (follow && isReconnecting) {
           isReconnecting = false;
@@ -464,7 +503,7 @@ class Pod extends KubeObject<KubePod> {
     return false;
   }
 
-  private hasPodReadyCondition(conditions: KubeCondition[]): boolean {
+  private hasPodReadyCondition(conditions: PodCondition[]): boolean {
     for (const condition of conditions) {
       if (condition.type === 'Ready' && condition.status === 'True') {
         return true;
@@ -545,7 +584,7 @@ class Pod extends KubeObject<KubePod> {
           continue;
         case !!container.state.terminated:
           if (!container.state.terminated!.reason) {
-            if (container.state.terminated!.signal !== 0) {
+            if (container.state.terminated!.signal) {
               reason = `Init:Signal:${container.state.terminated!.signal}`;
             } else {
               reason = `Init:ExitCode:${container.state.terminated!.exitCode}`;
@@ -573,6 +612,9 @@ class Pod extends KubeObject<KubePod> {
       restarts = restartableInitContainerRestarts;
       lastRestartDate = lastRestartableInitContainerRestartDate;
       let hasRunning = false;
+      // Reason and message of a container that exited with a non-zero code, if any
+      let errorReason = '';
+      let errorMessage = '';
       for (let i = (this.status?.containerStatuses?.length || 0) - 1; i >= 0; i--) {
         const container = this.status?.containerStatuses?.[i];
 
@@ -582,27 +624,34 @@ class Pod extends KubeObject<KubePod> {
         if (!!container.state.waiting?.reason) {
           reason = container.state.waiting.reason;
           message = container.state.waiting.message || '';
-        } else if (!!container.state.terminated?.reason) {
-          reason = container.state.terminated.reason;
-          message = container.state.terminated.message || '';
-        } else if (container.state.terminated?.reason === '') {
-          if (container.state.terminated.signal) {
+        } else if (!!container.state.terminated) {
+          if (!!container.state.terminated.reason) {
+            reason = container.state.terminated.reason;
+          } else if (container.state.terminated.signal) {
             reason = `Signal:${container.state.terminated.signal}`;
           } else {
             reason = `ExitCode:${container.state.terminated.exitCode}`;
           }
           message = container.state.terminated.message || '';
+          if (container.state.terminated.exitCode !== 0) {
+            errorReason = reason;
+            errorMessage = message;
+          }
         } else if (container.ready && !!container.state.running) {
           hasRunning = true;
           readyContainers++;
         }
       }
 
-      // change pod status back to "Running" if there is at least one container still reporting as "Running" status
-      if (reason === 'Completed' && hasRunning) {
-        if (this.hasPodReadyCondition(this.status?.conditions ?? [])) {
+      // A "Completed" container should not hide a running or failed one, as in kubectl:
+      // https://github.com/kubernetes/kubernetes/pull/124766
+      if (reason === 'Completed') {
+        if (hasRunning && this.hasPodReadyCondition(this.status?.conditions ?? [])) {
           reason = 'Running';
-        } else {
+        } else if (errorReason) {
+          reason = errorReason;
+          message = errorMessage;
+        } else if (hasRunning) {
           reason = 'NotReady';
         }
       }

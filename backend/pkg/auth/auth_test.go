@@ -18,6 +18,7 @@ package auth_test
 
 import (
 	"context"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
@@ -270,6 +271,59 @@ func TestParseClusterAndToken(t *testing.T) {
 	}
 }
 
+func TestStripBaseURL(t *testing.T) {
+	tests := []struct {
+		name    string
+		path    string
+		baseURL string
+		want    string
+	}{
+		{"no base URL", "/clusters/main/api", "", "/clusters/main/api"},
+		{"strips base URL", "/dev/headlamp/clusters/main/api", "/dev/headlamp", "/clusters/main/api"},
+		{"base URL with trailing slash", "/dev/headlamp/clusters/main/api", "/dev/headlamp/", "/clusters/main/api"},
+		{"path is the base URL", "/dev/headlamp", "/dev/headlamp", "/"},
+		{"only matches on a segment boundary", "/dev/hlx/clusters/main/api", "/dev/hl", "/dev/hlx/clusters/main/api"},
+		{"path outside base URL", "/clusters/main/api", "/dev/headlamp", "/clusters/main/api"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, auth.StripBaseURL(tt.path, tt.baseURL))
+		})
+	}
+}
+
+func TestParseClusterAndTokenWithBaseURL(t *testing.T) {
+	const baseURL = "/dev/internal/headlamp"
+
+	tests := []struct {
+		name        string
+		url         string
+		wantCluster string
+		wantToken   string
+	}{
+		{"cluster request under base URL", baseURL + "/clusters/main/api/v1/pods", "main", "cookie-token"},
+		{"request outside base URL", "/other/clusters/main/api/v1/pods", "", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, tt.url, nil)
+			req.AddCookie(&http.Cookie{
+				Name:     fmt.Sprintf("headlamp-auth-%s.0", auth.SanitizeClusterName("main")),
+				Value:    "cookie-token",
+				HttpOnly: true,
+				Secure:   true,
+				SameSite: http.SameSiteStrictMode,
+			})
+
+			cluster, token := auth.ParseClusterAndTokenWithBaseURL(req, baseURL)
+			assert.Equal(t, tt.wantCluster, cluster)
+			assert.Equal(t, tt.wantToken, token)
+		})
+	}
+}
+
 var berlinLocation = func() *time.Location {
 	loc, err := time.LoadLocation("Europe/Berlin")
 	if err != nil {
@@ -445,6 +499,10 @@ func (cacheStub) Get(ctx context.Context, k string) (interface{}, error) {
 	return nil, nil
 }
 
+func (cacheStub) UpdateIf(context.Context, string, interface{}, func(interface{}) bool) error {
+	return cache.ErrNotFound
+}
+
 func (cacheStub) GetAll(ctx context.Context, _ cache.Matcher) (map[string]interface{}, error) {
 	return map[string]interface{}{}, nil
 }
@@ -502,6 +560,29 @@ func (f *fakeCache) Set(_ context.Context, key string, val interface{}) error {
 	}{key, val})
 
 	return f.errOnSet
+}
+
+func (f *fakeCache) UpdateIf(ctx context.Context, key string, val interface{}, matches func(interface{}) bool) error {
+	if f.errOnGet != nil {
+		return f.errOnGet
+	}
+
+	current, ok := f.store[key]
+	if !ok {
+		return cache.ErrNotFound
+	}
+
+	if !matches(current) {
+		return errors.New("cache entry changed")
+	}
+
+	if err := f.Set(ctx, key, val); err != nil {
+		return err
+	}
+
+	f.store[key] = val
+
+	return nil
 }
 
 func (f *fakeCache) SetWithTTL(_ context.Context, key string, val interface{}, ttl time.Duration) error {
@@ -1368,6 +1449,49 @@ func TestConfigureTLSContext_CACert_PreservesDefaults(t *testing.T) {
 	assert.NotNil(t, tr.TLSClientConfig.RootCAs, "RootCAs should be set")
 }
 
+func TestConfigureTLSContextPreservesClonedMinimumVersion(t *testing.T) {
+	original := http.DefaultTransport
+	base := original.(*http.Transport).Clone()
+	base.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS13}
+	http.DefaultTransport = base
+
+	t.Cleanup(func() {
+		http.DefaultTransport = original
+	})
+
+	skipTLSVerify := true
+	ctx := auth.ConfigureTLSContext(context.Background(), &skipTLSVerify, nil)
+	client, ok := ctx.Value(oauth2.HTTPClient).(*http.Client)
+	require.True(t, ok)
+	transport, ok := client.Transport.(*http.Transport)
+	require.True(t, ok)
+	assert.Equal(t, uint16(tls.VersionTLS13), transport.TLSClientConfig.MinVersion)
+}
+
+func TestConfigureTLSContextConnectsToTLS12OnlyOIDCProvider(t *testing.T) {
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	//nolint:gosec // Intentionally only accepts TLS 1.2 to verify backwards compatibility.
+	server.TLS = &tls.Config{MinVersion: tls.VersionTLS12, MaxVersion: tls.VersionTLS12}
+	server.StartTLS()
+	t.Cleanup(server.Close)
+
+	skipTLSVerify := true
+	ctx := auth.ConfigureTLSContext(context.Background(), &skipTLSVerify, nil)
+	client := ctx.Value(oauth2.HTTPClient).(*http.Client)
+	request, err := http.NewRequestWithContext(context.Background(), http.MethodGet, server.URL, nil)
+	require.NoError(t, err)
+	response, err := client.Do(request)
+	require.NoError(t, err)
+
+	t.Cleanup(func() {
+		require.NoError(t, response.Body.Close())
+	})
+
+	assert.Equal(t, http.StatusNoContent, response.StatusCode)
+}
+
 func makeTestToken(t *testing.T, claims map[string]interface{}) string {
 	// helper to build unsigned JWT-like string for tests
 	header := map[string]string{"alg": "none", "typ": "JWT"}
@@ -1431,6 +1555,44 @@ func TestHandleMe_Success(t *testing.T) {
 	assert.Equal(t, "application/json", rr.Header().Get("Content-Type"))
 	assert.Equal(t, "no-store, no-cache, must-revalidate, private", rr.Header().Get("Cache-Control"))
 	assert.Equal(t, "Cookie", rr.Header().Get("Vary"))
+}
+
+func TestHandleMe_BaseURL(t *testing.T) {
+	t.Parallel()
+
+	token := makeTestToken(t, map[string]interface{}{
+		"preferred_username": "alice",
+		"exp":                float64(time.Now().Add(time.Hour).Unix()),
+	})
+
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet,
+		"/dev/internal/headlamp/clusters/test/me", nil)
+	req = mux.SetURLVars(req, map[string]string{"clusterName": "test"})
+	req.AddCookie(&http.Cookie{
+		Name:     fmt.Sprintf("headlamp-auth-%s.0", auth.SanitizeClusterName("test")),
+		Value:    token,
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteStrictMode,
+	})
+
+	rr := httptest.NewRecorder()
+
+	handler := auth.HandleMe(auth.MeHandlerOptions{
+		UsernamePaths: "preferred_username",
+		BaseURL:       "/dev/internal/headlamp",
+	})
+
+	handler(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	var got struct {
+		Username string `json:"username"`
+	}
+
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &got))
+	assert.Equal(t, "alice", got.Username)
 }
 
 func TestHandleMe_HeaderToken(t *testing.T) {

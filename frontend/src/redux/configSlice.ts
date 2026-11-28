@@ -16,9 +16,15 @@
 
 import type { PayloadAction } from '@reduxjs/toolkit';
 import { createSlice } from '@reduxjs/toolkit';
+import type { ClusterSourceView } from '../helpers/clusterPresentation';
 import type { Cluster } from '../lib/k8s/cluster';
 
 export interface ConfigState {
+  /**
+   * Definitions of the cluster sources known to the backend, used to group and label
+   * clusters. Empty for a backend that does not send them.
+   */
+  clusterSources?: ClusterSourceView[];
   /**
    * Clusters is a map of cluster names to cluster objects.
    * Null indicates that the clusters have not been loaded yet.
@@ -47,6 +53,11 @@ export interface ConfigState {
    * When true, users can add and delete clusters dynamically.
    */
   isDynamicClusterEnabled: boolean;
+  /**
+   * Whether the backend can discover the namespaces a user may access when the
+   * user is not allowed to list namespaces.
+   */
+  namespaceDiscoveryEnabled: boolean;
   /**
    * Whether users are allowed to remove clusters from their kubeconfig.
    * When true, the UI will show options to delete kubeconfig-sourced clusters.
@@ -89,12 +100,25 @@ export interface ConfigState {
     sidebarSortAlphabetically: boolean;
     useEvict: boolean;
     expandLargeGraph: boolean;
+    /**
+     * tutorialTooltips shows guided tooltips that help new users navigate Headlamp.
+     */
+    tutorialTooltips: boolean;
     [key: string]: any;
   };
+  /**
+   * The subset of `settings` the user has set explicitly. Only these are
+   * persisted, and only these take precedence over admin defaults.
+   */
+  userSettings?: Partial<ConfigState['settings']>;
   /**
    * Whether OIDC auto-login is enabled. Null indicates the value hasn't been loaded from the backend yet.
    */
   oidcAutoLogin: boolean | null;
+  /**
+   * Comma-separated list of trusted Backstage origins from the backend server.
+   */
+  backstageOrigin?: string;
 }
 
 export const defaultTableRowsPerPageOptions = [15, 25, 50, 100];
@@ -159,6 +183,9 @@ function loadStoredSettings(): Partial<ConfigState['settings']> {
     if (isBoolean(parsedSettings.expandLargeGraph)) {
       sanitizedSettings.expandLargeGraph = parsedSettings.expandLargeGraph;
     }
+    if (isBoolean(parsedSettings.tutorialTooltips)) {
+      sanitizedSettings.tutorialTooltips = parsedSettings.tutorialTooltips;
+    }
 
     return sanitizedSettings;
   } catch {
@@ -166,13 +193,39 @@ function loadStoredSettings(): Partial<ConfigState['settings']> {
   }
 }
 
-const storedSettings = loadStoredSettings();
+export const builtInSettings: Record<string, any> = {
+  tableRowsPerPageOptions: defaultTableRowsPerPageOptions,
+  timezone: defaultTimezone(),
+  sidebarSortAlphabetically: false,
+  expandLargeGraph: false,
+  useEvict: true,
+  tutorialTooltips: true,
+};
+
+/**
+ * Drops stored values equal to the built-in default. Older versions persisted
+ * every setting on opening the Settings page, so such values are not taken
+ * as user choices and do not hide admin defaults.
+ */
+function withoutBuiltInValues(
+  settings: Partial<ConfigState['settings']>
+): Partial<ConfigState['settings']> {
+  return Object.fromEntries(
+    Object.entries(settings).filter(
+      ([key, value]) => JSON.stringify(value) !== JSON.stringify(builtInSettings[key])
+    )
+  );
+}
+
+const storedSettings = withoutBuiltInValues(loadStoredSettings());
 
 export const initialState: ConfigState = {
+  clusterSources: [],
   clusters: null,
   statelessClusters: null,
   allClusters: null,
   isDynamicClusterEnabled: false,
+  namespaceDiscoveryEnabled: false,
   allowKubeconfigChanges: false,
   defaultPodDebugImage: '',
   defaultNodeShellImage: '',
@@ -180,12 +233,15 @@ export const initialState: ConfigState = {
   oidcAutoLogin: null,
   settings: {
     tableRowsPerPageOptions:
-      storedSettings.tableRowsPerPageOptions ?? defaultTableRowsPerPageOptions,
-    timezone: storedSettings.timezone || defaultTimezone(),
-    sidebarSortAlphabetically: storedSettings.sidebarSortAlphabetically ?? false,
-    expandLargeGraph: storedSettings.expandLargeGraph ?? false,
-    useEvict: storedSettings.useEvict ?? true,
+      storedSettings.tableRowsPerPageOptions ?? builtInSettings.tableRowsPerPageOptions,
+    timezone: storedSettings.timezone ?? builtInSettings.timezone,
+    sidebarSortAlphabetically:
+      storedSettings.sidebarSortAlphabetically ?? builtInSettings.sidebarSortAlphabetically,
+    expandLargeGraph: storedSettings.expandLargeGraph ?? builtInSettings.expandLargeGraph,
+    useEvict: storedSettings.useEvict ?? builtInSettings.useEvict,
+    tutorialTooltips: storedSettings.tutorialTooltips ?? builtInSettings.tutorialTooltips,
   },
+  userSettings: storedSettings,
 };
 
 const configSlice = createSlice({
@@ -201,7 +257,9 @@ const configSlice = createSlice({
       state,
       action: PayloadAction<{
         clusters: ConfigState['clusters'];
+        clusterSources?: ClusterSourceView[];
         isDynamicClusterEnabled?: boolean;
+        namespaceDiscoveryEnabled?: boolean;
         allowKubeconfigChanges?: boolean;
         defaultPodDebugImage?: string;
         defaultNodeShellImage?: string;
@@ -210,15 +268,25 @@ const configSlice = createSlice({
         defaultDarkTheme?: string;
         forceTheme?: string;
         oidcAutoLogin?: boolean;
+        backstageOrigin?: string;
       }>
     ) {
       state.clusters = action.payload.clusters;
+      if (action.payload.clusterSources !== undefined) {
+        state.clusterSources = action.payload.clusterSources;
+      }
 
       if (action.payload.oidcAutoLogin !== undefined) {
         state.oidcAutoLogin = action.payload.oidcAutoLogin;
       }
+      if (action.payload.backstageOrigin !== undefined) {
+        state.backstageOrigin = action.payload.backstageOrigin;
+      }
       if (action.payload.isDynamicClusterEnabled !== undefined) {
         state.isDynamicClusterEnabled = action.payload.isDynamicClusterEnabled;
+      }
+      if (action.payload.namespaceDiscoveryEnabled !== undefined) {
+        state.namespaceDiscoveryEnabled = action.payload.namespaceDiscoveryEnabled;
       }
       if (action.payload.allowKubeconfigChanges !== undefined) {
         state.allowKubeconfigChanges = action.payload.allowKubeconfigChanges;
@@ -256,7 +324,8 @@ const configSlice = createSlice({
       Object.keys(action.payload).forEach(key => {
         state.settings[key] = action.payload[key];
       });
-      localStorage.setItem('settings', JSON.stringify(state.settings));
+      state.userSettings = { ...state.userSettings, ...action.payload };
+      localStorage.setItem('settings', JSON.stringify(state.userSettings));
     },
   },
 });

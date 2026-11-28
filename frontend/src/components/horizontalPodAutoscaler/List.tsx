@@ -50,12 +50,17 @@ export default function HpaList() {
         {
           id: 'reference',
           label: t('translation|Reference'),
-          getValue: item => item.referenceObject?.metadata.name,
-          render: item => (
-            <Link kubeObject={item.referenceObject}>
-              {item.referenceObject?.kind}/{item.referenceObject?.metadata.name}
-            </Link>
-          ),
+          getValue: item => item.referenceObject?.metadata?.name ?? item.spec?.scaleTargetRef?.name,
+          render: item => {
+            const target = item.spec?.scaleTargetRef;
+            return item.referenceObject ? (
+              <Link kubeObject={item.referenceObject}>
+                {item.referenceObject?.kind}/{item.referenceObject?.metadata?.name}
+              </Link>
+            ) : target?.kind && target?.name ? (
+              `${target.kind}/${target.name}`
+            ) : null;
+          },
         },
         {
           id: 'targets',
@@ -90,19 +95,19 @@ export default function HpaList() {
           id: 'minReplicas',
           label: t('translation|MinReplicas'),
           gridTemplate: 'min-content',
-          getValue: item => item.spec.minReplicas,
+          getValue: item => item.spec?.minReplicas,
         },
         {
           id: 'maxReplicas',
           label: t('translation|MaxReplicas'),
           gridTemplate: 'min-content',
-          getValue: item => item.spec.maxReplicas,
+          getValue: item => item.spec?.maxReplicas,
         },
         {
           id: 'currentReplicas',
           label: t('glossary|Replicas'),
           gridTemplate: 'min-content',
-          getValue: item => item.status.currentReplicas,
+          getValue: item => item.status?.currentReplicas ?? 0,
         },
         'labels',
         'age',

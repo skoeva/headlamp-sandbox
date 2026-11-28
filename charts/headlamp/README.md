@@ -44,6 +44,53 @@ $ helm install my-headlamp headlamp/headlamp \
   --set config.oidc.issuerURL=https://your-issuer-url
 ```
 
+For mounted credentials, pass `-oidc-client-id-file` and
+`-oidc-client-secret-file` through `config.extraArgs`, or set their
+`HEADLAMP_CONFIG_OIDC_CLIENT_ID_FILE` and `HEADLAMP_CONFIG_OIDC_CLIENT_SECRET_FILE`
+environment variables. File-backed client IDs also satisfy the Cluster Inventory
+and Cluster API discovery checks; the issuer URL is still required. Remove direct
+credential settings that generate flags when switching to files, because direct
+flags take precedence.
+
+For discovery validation, direct client-ID flags in `config.extraArgs` override
+file-backed IDs and other client-ID settings. The last direct flag wins, including
+an empty value; an empty ID cannot fall back to a credential file and is rejected
+when discovery is enabled.
+
+Discovery flags in `config.extraArgs` also override the chart's enabled settings.
+Validation uses the final issuer and credential-file values, so earlier empty
+values are allowed when a later occurrence replaces them.
+
+Literal `HEADLAMP_CONFIG_ENABLE_CLUSTER_INVENTORY` and
+`HEADLAMP_CONFIG_ENABLE_CLUSTER_API` environment values seed discovery validation;
+generated chart flags and final `extraArgs` take precedence. References such as
+`$(DISCOVERY_ENABLED)` are resolved when their environment value is literal.
+Invalid discovery environment strings behave as false, matching the backend;
+explicit discovery argument values still require a valid boolean.
+
+Environment references in discovery and OIDC arguments are expanded once for
+validation, including references to earlier literal environment entries and
+escaped dollars. Known empty client IDs, issuer URLs, and credential-file paths
+are checked after expansion. Pod-only values defer only the checks that depend
+on them to Headlamp's startup validation rather than guessing their values.
+
+When migrating from a chart-created OIDC Secret, first create a separately managed
+Secret with a different name, such as `headlamp-oidc-files`, containing the credential
+keys. Mount that Secret through `volumes` and `volumeMounts` before switching to file
+flags. Set `config.oidc.secret.create=false`, clear the direct credential settings,
+and disable `config.oidc.externalSecret.enabled` if it was generating direct flags.
+Do not use the old chart-managed Secret as the mounted source: removing its values
+can remove its credential keys, and disabling its creation can delete it on upgrade.
+
+If disabling `config.oidc.externalSecret.enabled`, migrate the issuer URL as well,
+for example to `config.oidc.issuerURL` or `HEADLAMP_CONFIG_OIDC_IDP_ISSUER_URL`.
+Preserve any required scopes, callback URL, validator settings, and other OIDC
+options; credential files supply only the client ID and secret.
+
+Credential files are read only at startup. Restart Headlamp pods after rotating
+credentials; updating Kubernetes Secret or CSI-mounted files alone does not
+reload the credentials used for sign-in and token refresh.
+
 ### Installation with Ingress
 ```console
 $ helm install my-headlamp headlamp/headlamp \
@@ -65,51 +112,6 @@ $ helm upgrade my-headlamp headlamp/headlamp \
   --reuse-values \
   --set image.tag=v<appVersion>
 ```
-
-### Installation with Cluster Inventory
-
-> **Warning**
-> Cluster Inventory support in Headlamp is alpha/experimental and disabled by
-> default. The upstream Cluster Inventory API is currently `v1alpha1` and this
-> integration uses the `v0.1.x` API, so fields and behavior may change.
-
-```console
-$ helm install my-headlamp headlamp/headlamp \
-  --namespace kube-system \
-  --values cluster-inventory-values.yaml
-```
-
-`cluster-inventory-values.yaml`:
-
-```yaml
-config:
-  clusterInventory:
-    enabled: true
-    accessProvidersConfig:
-      providers:
-        - name: secretreader
-          execConfig:
-            apiVersion: client.authentication.k8s.io/v1
-            command: /access-plugins/secretreader/bin/secretreader-plugin
-            interactiveMode: Never
-            provideClusterInfo: true
-        - name: kubeconfig-secretreader
-          execConfig:
-            apiVersion: client.authentication.k8s.io/v1
-            command: /access-plugins/kubeconfig-secretreader/bin/kubeconfig-secretreader-plugin
-            interactiveMode: Never
-            provideClusterInfo: true
-    plugins:
-      - name: secretreader
-        image: registry.k8s.io/cluster-inventory-api/secretreader:v0.1.3@sha256:ec3090dc166aa2b42fb35d714d161c417d8b27bbc463404c8f615f5f4c610a1d
-        mountPath: /access-plugins/secretreader
-      - name: kubeconfig-secretreader
-        image: registry.k8s.io/cluster-inventory-api/kubeconfig-secretreader:v0.1.3@sha256:b92966cc6e4ac78002a63862921022a71d54956826f6e4febcb7247495eb98c0
-        mountPath: /access-plugins/kubeconfig-secretreader
-```
-
-`plugins[]` mounts Cluster Inventory access provider binaries as Kubernetes
-`image` volumes; it is not for Headlamp UI plugins.
 
 ## Configuration
 
@@ -139,12 +141,13 @@ config:
 | config.nodeShellImage | string | `""`               | Default image to use when creating node shell pods                         |
 | config.nodeShellNamespace | string | `""`            | Default namespace to use when creating node shell pods                      |
 | config.clusterInventory.enabled | bool | `false` | Enable experimental/alpha Cluster Inventory discovery |
-| config.clusterInventory.accessProvidersConfig | object | `{}` | Experimental/alpha Cluster Inventory access providers config. Required when Cluster Inventory is enabled |
-| config.clusterInventory.plugins | list | `[]` | Kubernetes image volumes that provide experimental/alpha Cluster Inventory access provider binaries |
 | config.clusterInventory.labelSelector | string | `"!headlamp.dev/ignore"` | Kubernetes label selector used to filter experimental/alpha ClusterProfile resources |
 | config.clusterInventory.namespaces | list | `[]` | Namespaces watched for experimental/alpha ClusterProfile resources. Empty uses the Headlamp pod namespace for in-cluster roots and the kubeconfig context namespace for kubeconfig roots; `["*"]` watches all and requires equivalent cluster-wide RBAC permissions |
 | config.clusterInventory.rootReconcileInterval | string | `""` | Override the experimental/alpha Cluster Inventory root reconcile interval. Empty uses the Headlamp default |
 | config.clusterInventory.noCRDCacheTTL | string | `""` | Override the experimental/alpha Cluster Inventory no-CRD cache TTL. Empty uses the Headlamp default |
+| config.clusterAPI.enabled | bool | `false` | Enable Cluster API v1beta2 discovery with per-user OIDC |
+| config.clusterAPI.labelSelector | string | `"!headlamp.dev/ignore"` | Select Cluster API Cluster resources |
+| config.clusterAPI.namespaces | list | `[]` | Management namespaces; empty uses each root default, `["*"]` watches all |
 | config.extraArgs   | array  | `[]`                  | Additional arguments for Headlamp server                                  |
 | config.tlsCertPath | string | `""`                  | Certificate for serving TLS                                               |
 | config.tlsKeyPath  | string | `""`                  | Key for serving TLS                                                       |
@@ -165,6 +168,7 @@ volume or volume mount.
 | config.oidc.usePKCE | bool | `false` | Use PKCE (Proof Key for Code Exchange) for enhanced security in OIDC flow |
 | config.oidc.useCookie | bool | `false` | Enable using OIDC cookie for authentication outside of cluster |
 | config.oidc.autoLogin | bool | `false` | Enable automatic redirect to the OIDC provider |
+| config.oidc.useTokenBroadcast | bool | `false` | After a login, also set the auth cookie for other kubeconfig contexts with the same issuer URL and client ID. Also applies with `externalSecret` |
 | config.oidc.secret.create | bool | `true` | Create OIDC secret using provided values |
 | config.oidc.secret.name | string | `"oidc"` | Name of the OIDC secret |
 | config.oidc.externalSecret.enabled | bool | `false` | Enable using external secret for OIDC |
@@ -212,42 +216,57 @@ config:
 > default. The upstream Cluster Inventory API is currently `v1alpha1` and this
 > integration uses the `v0.1.x` API, so fields and behavior may change.
 
-When `config.clusterInventory.enabled` is true, the chart creates a provider
-ConfigMap, makes it available read-only at `/etc/cluster-inventory/config.json`,
-and adds the Headlamp Cluster Inventory flags automatically.
+When `config.clusterInventory.enabled` is true, every discovered cluster uses
+Headlamp's configured OIDC login. Its Kubernetes API server validates each
+user's token and applies that user's RBAC. The chart requires an OIDC client ID
+and issuer, supplied through `config.oidc`, the existing OIDC environment
+variables, or `config.oidc.externalSecret`.
 
 ```yaml
 config:
+  oidc:
+    clientID: headlamp
+    clientSecret: your-client-secret
+    issuerURL: https://idp.example.com
+    scopes: profile,email,offline_access
   clusterInventory:
     enabled: true
-    accessProvidersConfig:
-      providers:
-        - name: secretreader
-          execConfig:
-            apiVersion: client.authentication.k8s.io/v1
-            command: /access-plugins/secretreader/bin/secretreader-plugin
-            interactiveMode: Never
-            provideClusterInfo: true
-        - name: kubeconfig-secretreader
-          execConfig:
-            apiVersion: client.authentication.k8s.io/v1
-            command: /access-plugins/kubeconfig-secretreader/bin/kubeconfig-secretreader-plugin
-            interactiveMode: Never
-            provideClusterInfo: true
-    plugins:
-      - name: secretreader
-        image: registry.k8s.io/cluster-inventory-api/secretreader:v0.1.3@sha256:ec3090dc166aa2b42fb35d714d161c417d8b27bbc463404c8f615f5f4c610a1d
-        mountPath: /access-plugins/secretreader
-      - name: kubeconfig-secretreader
-        image: registry.k8s.io/cluster-inventory-api/kubeconfig-secretreader:v0.1.3@sha256:b92966cc6e4ac78002a63862921022a71d54956826f6e4febcb7247495eb98c0
-        mountPath: /access-plugins/kubeconfig-secretreader
+    namespaces:
+      - inventory-team-a
 ```
 
-`plugins[]` is for Cluster Inventory access provider binaries, not Headlamp UI
-plugins. Each entry renders as a Kubernetes `image` volume and is mounted
-read-only into the Headlamp container. If an access provider `execConfig.command`
-is configured, the command must be under one of the absolute
-`plugins[].mountPath` values.
+The pod's service account reads ClusterProfiles; it is not used to authenticate
+user requests to discovered clusters. Each valid access-provider entry becomes a
+separate selectable connection with `-<access-provider-name>` appended to its name.
+Invalid entries are excluded independently. All discovered API servers must trust
+the configured OIDC issuer and client.
+
+The chart no longer creates a provider ConfigMap or mounts access-provider
+binaries. It ignores the former defaults `accessProvidersConfig: {}` and
+`plugins: []` and rejects nonempty settings under either key. Headlamp UI plugins
+configured elsewhere are independent of Cluster Inventory.
+
+### Cluster API discovery
+
+Enable `config.clusterAPI.enabled` to discover `cluster.x-k8s.io/v1beta2` Clusters.
+The adapter reads each Cluster's standard `<cluster>-kubeconfig` Secret for
+connection and TLS settings, then uses the same OIDC kubeconfig loader as Cluster
+Inventory. Credentials in the Secret are not used for workload access.
+
+```yaml
+config:
+  clusterAPI:
+    enabled: true
+    namespaces:
+      - workload-team-a
+```
+
+The OIDC settings above are required. The Headlamp service account needs
+`get`, `list`, and `watch` permissions on Cluster API `clusters` and core `secrets`
+in the selected namespaces. `config.clusterAPI.labelSelector` defaults to
+`!headlamp.dev/ignore`. With empty `namespaces`, discovery uses the pod namespace
+in-cluster or the management kubeconfig context's namespace outside a cluster.
+Use `["*"]` only when discovery has equivalent cluster-wide permissions.
 
 ### Deployment Configuration
 
@@ -263,6 +282,8 @@ is configured, the command must be under one of the absolute
 | fullnameOverride | string | `""` | Override the full name of the chart |
 | namespaceOverride | string | `""` | Override the deployment namespace; defaults to .Release.Namespace |
 | initContainers | list | `[]` | Init containers to run before main container |
+| deploymentLabels | object | `{}` | Labels to add to the deployment, supports templated values. |
+| deploymentAnnotations | object | `{}` | Annotations to add to the deployment |
 
 ### Security Configuration
 
@@ -365,6 +386,33 @@ ingress:
         - headlamp.example.com
 ```
 
+The Ingress annotations and host name can use templated values; for example:
+
+Example ingress configuration:
+```yaml
+global:
+  ingress:
+    hostAlias: headlamp-alias.example.com
+    host: headlamp.example.com
+ingress:
+  enabled: true
+  annotations:
+    kubernetes.io/tls-acme: "true"
+    example.com/alias: '{{ .Values.global.ingress.hostAlias }}'
+  labels:
+    app.kubernetes.io/part-of: traefik
+    environment: prod
+  hosts:
+    - host: '{{ .Values.global.ingress.host }}'
+      paths:
+        - path: /
+          type: ImplementationSpecific
+  tls:
+    - secretName: headlamp-tls
+      hosts:
+        - '{{ .Values.global.ingress.host }}'
+```
+
 Each path under `ingress.hosts[].paths[]` may optionally specify
 `backend.service.{name,port}` to override the default Headlamp Service /
 `service.port`. This is typically combined with `service.extraServicePorts` to
@@ -440,7 +488,9 @@ httpRoute:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| probes.scheme | string | `"HTTP"` | Scheme for liveness/readiness probes (HTTP or HTTPS). Set to HTTPS when TLS is enabled at the backend. |
+| probes.scheme | string | `"HTTP"` | Scheme for the default liveness/readiness HTTP probes. Set to HTTPS when TLS is enabled at the backend. |
+| probes.livenessProbe.custom | object | `{}` | Complete Kubernetes liveness probe; when nonempty, replaces the default HTTP probe and its settings. |
+| probes.readinessProbe.custom | object | `{}` | Complete Kubernetes readiness probe; when nonempty, replaces the default HTTP probe and its settings. |
 | probes.livenessProbe.initialDelaySeconds | int | `0` | Initial delay before liveness probe starts |
 | probes.livenessProbe.periodSeconds | int | `10` | Period between liveness checks |
 | probes.livenessProbe.timeoutSeconds | int | `1` | Timeout for liveness probe |
@@ -452,7 +502,35 @@ httpRoute:
 | probes.readinessProbe.successThreshold | int | `1` | Minimum consecutive successes |
 | probes.readinessProbe.failureThreshold | int | `3` | Minimum consecutive failures |
 
-When using TLS termination at the backend server, you must set `probes.scheme` to `HTTPS`:
+By default, both probes use HTTP against the chart's `http` port and
+`config.baseURL`. Set either `custom` value to a complete Kubernetes probe to
+use a different handler (such as `exec`, `httpGet`, `tcpSocket`, or `grpc`). A
+nonempty override replaces that probe completely: `probes.scheme` and the
+other settings for that probe are ignored. Kubernetes defaults apply to any
+omitted timing fields, and a custom liveness probe's `successThreshold` must
+be 1.
+
+For example, if Headlamp is configured to listen on container loopback port
+4467 behind an authentication proxy, an exec probe can check the backend without
+exposing an unauthenticated network endpoint. Verify the configured executable
+exists in your chosen image:
+
+```yaml
+probes:
+  livenessProbe:
+    custom:
+      exec:
+        command: ["/usr/bin/wget", "-q", "--spider", "-T", "3", "http://127.0.0.1:4467/"]
+      timeoutSeconds: 5
+  readinessProbe:
+    custom:
+      exec:
+        command: ["/usr/bin/wget", "-q", "--spider", "-T", "3", "http://127.0.0.1:4467/"]
+      timeoutSeconds: 5
+```
+
+When using TLS termination at the backend server, set `probes.scheme` to
+`HTTPS` for the default HTTP probes:
 
 ```yaml
 config:

@@ -48,6 +48,8 @@ export interface ConditionListProps {
    * Defaults to false because most callers do not need it.
    */
   showLastUpdate?: boolean;
+  /** Condition types whose True status indicates an error. */
+  errorConditionTypes?: readonly string[];
 }
 
 /**
@@ -60,6 +62,7 @@ export interface ConditionListProps {
  *
  * - status === 'True'  -> 'success'
  * - status === 'False' -> 'error'
+ * - for negative conditions (e.g. ReplicaFailure): 'False' -> 'success', 'True' -> 'error'
  * - anything else      -> '' (neutral chip)
  *
  * @example
@@ -70,7 +73,11 @@ export interface ConditionListProps {
  * // With the extra Last Update column
  * <ConditionList conditions={resource.status?.conditions} showLastUpdate />
  */
-export function ConditionList({ conditions, showLastUpdate = false }: ConditionListProps) {
+export function ConditionList({
+  conditions,
+  showLastUpdate = false,
+  errorConditionTypes,
+}: ConditionListProps) {
   const { t } = useTranslation(['glossary', 'translation']);
 
   if (!conditions || conditions.length === 0) {
@@ -78,7 +85,14 @@ export function ConditionList({ conditions, showLastUpdate = false }: ConditionL
   }
 
   function statusFromCondition(condition: KubeCondition): StatusLabelProps['status'] {
-    if (condition.status === 'True') return 'success';
+    const type = condition.type?.toLowerCase();
+    // ReplicaFailure is True when the controller cannot create pods.
+    if (type === 'replicafailure') {
+      return condition.status === 'False' ? 'success' : condition.status === 'True' ? 'error' : '';
+    }
+
+    if (condition.status === 'True')
+      return errorConditionTypes?.includes(condition.type) ? 'error' : 'success';
     if (condition.status === 'False') return 'error';
     return '';
   }
@@ -123,7 +137,7 @@ export function ConditionList({ conditions, showLastUpdate = false }: ConditionL
         condition.reason ? (
           <HoverInfoLabel label={condition.reason} hoverInfo={condition.message} />
         ) : (
-          '-'
+          condition.message || '-'
         ),
     },
   ];

@@ -16,25 +16,17 @@ package k8cache
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	"github.com/kubernetes-sigs/headlamp/backend/pkg/cache"
 	"github.com/kubernetes-sigs/headlamp/backend/pkg/logger"
 )
 
 // cacheKeyBelongsToContext reports whether a k8cache entry key belongs to the
-// given Headlamp context. Keys use the format group+resource+namespace+context.
+// given Headlamp connection revision.
 func cacheKeyBelongsToContext(key, contextKey string) bool {
-	if contextKey == "" {
-		return false
-	}
+	parsed, ok := parseCacheKey(key)
 
-	parts := strings.SplitN(key, "+", 4)
-	if len(parts) < 4 {
-		return false
-	}
-
-	return parts[3] == escapeCacheKeySegment(contextKey)
+	return ok && parsed.Context == contextKey
 }
 
 // PurgeCacheForContext removes all cached API responses for a removed context.
@@ -68,7 +60,7 @@ func PurgeCacheForContext(k8scache cache.Cache[string], contextKey string) {
 }
 
 // collectCachedContextKeys returns Headlamp context keys that still have k8cache,
-// clientset cache, or in-flight clientset creation entries.
+// clientset cache, in-flight clientset creation, or SSAR authorization entries.
 func collectCachedContextKeys(k8scache cache.Cache[string]) map[string]struct{} {
 	keys := make(map[string]struct{})
 
@@ -88,6 +80,22 @@ func collectCachedContextKeys(k8scache cache.Cache[string]) map[string]struct{} 
 
 	mu.Unlock()
 
+	ssarMu.RLock()
+
+	for cacheKey := range ssarCache {
+		if prefix := ssarCachePrefixFromCacheKey(cacheKey); prefix != "" {
+			keys[prefix] = struct{}{}
+		}
+	}
+
+	for cacheKey := range ssarInFlight {
+		if prefix := ssarCachePrefixFromCacheKey(cacheKey); prefix != "" {
+			keys[prefix] = struct{}{}
+		}
+	}
+
+	ssarMu.RUnlock()
+
 	if k8scache == nil {
 		return keys
 	}
@@ -100,9 +108,8 @@ func collectCachedContextKeys(k8scache cache.Cache[string]) map[string]struct{} 
 	}
 
 	for key := range allKeys {
-		parts := strings.SplitN(key, "+", 4)
-		if len(parts) == 4 && parts[3] != "" {
-			keys[unescapeCacheKeySegment(parts[3])] = struct{}{}
+		if parsed, ok := parseCacheKey(key); ok {
+			keys[parsed.Context] = struct{}{}
 		}
 	}
 

@@ -33,6 +33,9 @@ import {
   defaultPluginsDir,
   defaultUserPluginsDir,
   getExtraFiles,
+  isExistingDirectory,
+  isPathWithinDirectory,
+  normalizeChecksum,
   PluginManager,
   preparePluginExecutable,
   preparePluginScript,
@@ -616,11 +619,23 @@ describe('PluginManager', () => {
     // Reset progress array for uninstall
     progress.length = 0;
 
-    // Uninstall the plugin from the same directory
-    PluginManager.uninstall('headlamp_minikube', pluginDestDir, progressCallback);
+    // Uninstall the plugin from the same directory. Give it a package name that differs
+    // from its folder, as scoped packages have, so the cleanup must get the folder.
+    const packageJsonPath = path.join(pluginDir, 'package.json');
+    const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
+    fs.writeFileSync(
+      packageJsonPath,
+      JSON.stringify({ ...packageJson, name: '@example/minikube' })
+    );
+    const beforeRemove = vi.fn((folderName: string) => {
+      // Called while the bundle can still be found, so its cleanup can be retried
+      expect(fs.existsSync(path.join(pluginDestDir, folderName))).toBe(true);
+    });
+    PluginManager.uninstall('@example/minikube', pluginDestDir, progressCallback, beforeRemove);
 
     // Verify the plugin was uninstalled
     expect(fs.existsSync(pluginDir)).toBe(false);
+    expect(beforeRemove).toHaveBeenCalledExactlyOnceWith('headlamp_minikube');
 
     // Verify success message
     const successMessages = progress.filter(p => p.type === 'success');
@@ -634,6 +649,47 @@ describe('PluginManager', () => {
     if (fs.existsSync(testDataDir)) {
       fs.rmSync(testDataDir, { recursive: true });
     }
+  }, 30000);
+
+  it('keeps the bundle when the cleanup before uninstalling it fails', async () => {
+    const testDataDir = getUniqueTestDir(TEST_DATA_BASE_DIR, 'uninstall-cleanup-test-data');
+    const pluginDestDir = getUniqueTestDir(PLUGIN_DEST_BASE_DIR, 'uninstall-cleanup-test-plugins');
+    await createMinimalPluginTarball(testDataDir);
+    mockArtifactHubAPIWithoutPlatformSpecific(testDataDir);
+    const pluginURL = 'https://artifacthub.io/packages/headlamp/test-repo/headlamp_minikube';
+    await PluginManager.install(pluginURL, pluginDestDir, HEADLAMP_VERSION, null, null);
+    const pluginDir = path.join(pluginDestDir, 'headlamp_minikube');
+    const progress: any[] = [];
+
+    // For example, settings.json can't be written, so the bundle's consents can't be cleared.
+    PluginManager.uninstall(
+      'headlamp_minikube',
+      pluginDestDir,
+      update => progress.push(update),
+      () => {
+        throw new Error('settings.json is read-only');
+      }
+    );
+
+    expect(progress).toEqual([{ type: 'error', message: 'settings.json is read-only' }]);
+    expect(fs.existsSync(pluginDir)).toBe(true);
+
+    // A retry still finds the bundle, so its cleanup runs again.
+    const beforeRemove = vi.fn();
+    progress.length = 0;
+    PluginManager.uninstall(
+      'headlamp_minikube',
+      pluginDestDir,
+      update => progress.push(update),
+      beforeRemove
+    );
+
+    expect(beforeRemove).toHaveBeenCalledExactlyOnceWith('headlamp_minikube');
+    expect(progress).toEqual([{ type: 'success', message: 'Plugin Uninstalled' }]);
+    expect(fs.existsSync(pluginDir)).toBe(false);
+
+    fs.rmSync(pluginDestDir, { recursive: true, force: true });
+    fs.rmSync(testDataDir, { recursive: true, force: true });
   }, 30000);
 });
 
@@ -811,7 +867,10 @@ function mockArtifactHubAPI(testDataDir: string, version = '0.1.0') {
 /**
  * Mock the ArtifactHub API without platform-specific archives
  */
-function mockArtifactHubAPIWithoutPlatformSpecific(testDataDir: string) {
+function mockArtifactHubAPIWithoutPlatformSpecific(
+  testDataDir: string,
+  formatChecksum: (hex: string) => string = hex => `sha256:${hex}`
+) {
   try {
     // Calculate checksums for the tarball
     const pluginTarballPath = path.join(testDataDir, 'plugin-tarball.tar.gz');
@@ -844,7 +903,7 @@ function mockArtifactHubAPIWithoutPlatformSpecific(testDataDir: string) {
         },
         data: {
           'headlamp/plugin/archive-url': pluginArchiveURL,
-          'headlamp/plugin/archive-checksum': `sha256:${pluginChecksum}`,
+          'headlamp/plugin/archive-checksum': formatChecksum(pluginChecksum),
           'headlamp/plugin/version-compat': '>=0.22',
           'headlamp/plugin/distro-compat': 'in-cluster,web,docker-desktop,desktop',
           // Empty extra-files to indicate no platform-specific files
@@ -891,6 +950,81 @@ function calculateSHA256(filePath: string): string {
     throw error;
   }
 }
+
+describe('normalizeChecksum', () => {
+  const hex = 'a3b4c5d6e7f8a3b4c5d6e7f8a3b4c5d6e7f8a3b4c5d6e7f8a3b4c5d6e7f80000';
+
+  it('accepts the sha256: prefix in any case', () => {
+    expect(normalizeChecksum(`sha256:${hex}`)).toBe(hex);
+    expect(normalizeChecksum(`SHA256:${hex}`)).toBe(hex);
+    expect(normalizeChecksum(`Sha256:${hex}`)).toBe(hex);
+  });
+
+  it('accepts a digest without a prefix', () => {
+    expect(normalizeChecksum(hex)).toBe(hex);
+  });
+
+  it('lowercases uppercase hex, as printed by Get-FileHash', () => {
+    expect(normalizeChecksum(`SHA256:${hex.toUpperCase()}`)).toBe(hex);
+  });
+
+  it('trims surrounding whitespace', () => {
+    expect(normalizeChecksum(`  SHA256:${hex}\n`)).toBe(hex);
+  });
+
+  it('rejects values that are not a SHA-256 hex digest', () => {
+    expect(() => normalizeChecksum('sha256:dummy')).toThrow('Invalid checksum');
+    expect(() => normalizeChecksum(`sha256:${hex}00`)).toThrow('Invalid checksum');
+    expect(() => normalizeChecksum('md5:d41d8cd98f00b204e9800998ecf8427e')).toThrow(
+      'Invalid checksum'
+    );
+  });
+});
+
+describe('PluginManager archive-checksum formats', () => {
+  const pluginURL = 'https://artifacthub.io/packages/headlamp/test-repo/headlamp_minikube';
+
+  it.each([
+    ['uppercase hex', (hex: string) => `SHA256:${hex.toUpperCase()}`],
+    ['a mixed-case prefix', (hex: string) => `Sha256:${hex}`],
+    ['a trailing newline', (hex: string) => `SHA256:${hex}\n`],
+  ])(
+    'installs a plugin whose checksum uses %s',
+    async (_label, formatChecksum) => {
+      const testDataDir = getUniqueTestDir(TEST_DATA_BASE_DIR, 'checksum-format-data');
+      const pluginDestDir = getUniqueTestDir(PLUGIN_DEST_BASE_DIR, 'checksum-format-plugins');
+      try {
+        await createMinimalPluginTarball(testDataDir);
+        mockArtifactHubAPIWithoutPlatformSpecific(testDataDir, formatChecksum);
+
+        await PluginManager.install(pluginURL, pluginDestDir, HEADLAMP_VERSION, null, null);
+
+        expect(fs.existsSync(path.join(pluginDestDir, 'headlamp_minikube', 'main.js'))).toBe(true);
+      } finally {
+        fs.rmSync(pluginDestDir, { recursive: true, force: true });
+        fs.rmSync(testDataDir, { recursive: true, force: true });
+      }
+    },
+    30000
+  );
+
+  it('still rejects a checksum that does not match the archive', async () => {
+    const testDataDir = getUniqueTestDir(TEST_DATA_BASE_DIR, 'checksum-mismatch-data');
+    const pluginDestDir = getUniqueTestDir(PLUGIN_DEST_BASE_DIR, 'checksum-mismatch-plugins');
+    try {
+      await createMinimalPluginTarball(testDataDir);
+      mockArtifactHubAPIWithoutPlatformSpecific(testDataDir, () => `SHA256:${'0'.repeat(64)}`);
+
+      await expect(
+        PluginManager.install(pluginURL, pluginDestDir, HEADLAMP_VERSION, null, null)
+      ).rejects.toThrow('Checksum mismatch.');
+      expect(fs.existsSync(path.join(pluginDestDir, 'headlamp_minikube'))).toBe(false);
+    } finally {
+      fs.rmSync(pluginDestDir, { recursive: true, force: true });
+      fs.rmSync(testDataDir, { recursive: true, force: true });
+    }
+  }, 30000);
+});
 
 describe('getExtraFiles', () => {
   it.each(['nested/../../outside', 'nested\\..\\..\\outside', '/outside', 'C:\\outside'])(
@@ -964,6 +1098,35 @@ describe('getExtraFiles', () => {
         'https://github.com/kubernetes/minikube/releases/download/v1.0.0/minikube-linux-amd64.tar.gz',
     };
     expect(getExtraFiles(annotations)).toBeUndefined();
+  });
+
+  it('ignores prototype-pollution annotation keys without mutating Object.prototype', () => {
+    const annotations = JSON.parse(
+      JSON.stringify({
+        '__proto__/pollutedFromProto': 'yes',
+        'constructor/prototype/pollutedFromCtor': 'yes',
+        'headlamp/plugin/extra-files/__proto__/pollutedNested': 'yes',
+        'headlamp/plugin/extra-files/0/url':
+          'https://github.com/kubernetes/minikube/releases/download/v1.0.0/minikube-linux-amd64.tar.gz',
+        'headlamp/plugin/extra-files/0/checksum': 'sha256:abc123',
+        'headlamp/plugin/extra-files/0/arch': 'linux/x64',
+        'headlamp/plugin/extra-files/0/output/minikube/output': 'minikube',
+        'headlamp/plugin/extra-files/0/output/minikube/input': 'minikube-linux-amd64',
+      })
+    ) as Record<string, string>;
+
+    try {
+      const extraFiles = getExtraFiles(annotations);
+      expect(extraFiles).toBeDefined();
+      expect(Object.values(extraFiles!)).toHaveLength(1);
+      expect(({} as Record<string, unknown>).pollutedFromProto).toBeUndefined();
+      expect(({} as Record<string, unknown>).pollutedFromCtor).toBeUndefined();
+      expect(({} as Record<string, unknown>).pollutedNested).toBeUndefined();
+    } finally {
+      delete (Object.prototype as Record<string, unknown>).pollutedFromProto;
+      delete (Object.prototype as Record<string, unknown>).pollutedFromCtor;
+      delete (Object.prototype as Record<string, unknown>).pollutedNested;
+    }
   });
 });
 
@@ -1114,4 +1277,69 @@ describe('TLS error detection', () => {
       }
     }
   }, 30000);
+});
+
+describe('isPathWithinDirectory', () => {
+  const baseDir = path.join(os.tmpdir(), 'headlamp-plugins-test-base');
+
+  it('allows a normal plugin folder name', () => {
+    const target = path.join(baseDir, 'headlamp-my-plugin');
+    expect(isPathWithinDirectory(baseDir, target)).toBe(true);
+  });
+
+  it('allows a nested subdirectory', () => {
+    const target = path.join(baseDir, 'sub', 'plugin');
+    expect(isPathWithinDirectory(baseDir, target)).toBe(true);
+  });
+
+  it('allows a folder name that starts with ..', () => {
+    const target = path.join(baseDir, '..foo');
+    expect(isPathWithinDirectory(baseDir, target)).toBe(true);
+  });
+
+  it('rejects a folder name that traverses outside the base directory', () => {
+    const target = path.join(baseDir, '..', '..', '..', 'etc');
+    expect(isPathWithinDirectory(baseDir, target)).toBe(false);
+  });
+
+  it('rejects the base directory itself', () => {
+    expect(isPathWithinDirectory(baseDir, baseDir)).toBe(false);
+  });
+
+  it('rejects an unrelated absolute path', () => {
+    expect(isPathWithinDirectory(baseDir, '/etc/passwd')).toBe(false);
+  });
+});
+
+// The IPC contract only reveals plugin directories, so containment alone is not
+// enough: a renderer-supplied name can still resolve to an in-tree file.
+describe('isExistingDirectory', () => {
+  const baseDir = getUniqueTestDir(TEST_DATA_BASE_DIR, 'is-existing-directory');
+
+  afterEach(() => {
+    if (fs.existsSync(baseDir)) {
+      fs.rmSync(baseDir, { recursive: true });
+    }
+  });
+
+  it('accepts a directory', () => {
+    const pluginDir = path.join(baseDir, 'headlamp-my-plugin');
+    fs.mkdirSync(pluginDir, { recursive: true });
+
+    expect(isExistingDirectory(pluginDir)).toBe(true);
+  });
+
+  it('rejects a file', () => {
+    const binDir = path.join(baseDir, 'headlamp-my-plugin', 'bin');
+    fs.mkdirSync(binDir, { recursive: true });
+
+    const binary = path.join(binDir, 'tool');
+    fs.writeFileSync(binary, 'binary');
+
+    expect(isExistingDirectory(binary)).toBe(false);
+  });
+
+  it('rejects a path that does not exist', () => {
+    expect(isExistingDirectory(path.join(baseDir, 'missing'))).toBe(false);
+  });
 });

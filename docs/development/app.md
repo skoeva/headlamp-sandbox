@@ -24,6 +24,13 @@ npm run app:build
 
 This command builds the frontend, sets up plugins, and compiles the Electron app into a distributable package.
 
+Makefile packaging targets also rebuild the frontend before preparing the app,
+even when `frontend/build` already exists.
+
+Backend compiler/linker settings are inherited by desktop packaging. For an
+unstripped backend, set `GOFLAGS='-ldflags='` when running the packaging command. See
+[backend compiler flags and debugging information](./backend.md#compiler-flags-and-debugging-information).
+
 To build without creating installers (faster for development):
 
 ```bash
@@ -71,6 +78,18 @@ npm run app:format
 ```
 
 ## Test
+
+On Linux or macOS, run build dependency regression tests from the repository
+root with `node --test tools/build-dependencies.test.js`. These tests require
+Bash, GNU Make, Node.js, Go, and a C compiler on `PATH`. The dash-specific
+interrupted-build cleanup regression is skipped when `/bin/dash` is unavailable
+and runs on Linux CI; native Windows is not
+supported by the full suite. The portable entrypoint and artifact-verification
+subset also runs on native Windows:
+
+```bash
+node --test --test-name-pattern="native build entrypoints" tools/build-dependencies.test.js
+```
 
 Run unit tests:
 

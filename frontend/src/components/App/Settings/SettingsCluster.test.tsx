@@ -14,14 +14,23 @@
  * limitations under the License.
  */
 
+import '../../../i18n/config';
 import { ThemeProvider } from '@mui/material/styles';
+import { configureStore } from '@reduxjs/toolkit';
 import { act, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import { useState } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { storeClusterSettings } from '../../../helpers/clusterSettings';
 import i18n from '../../../i18n/config';
 import { createMuiTheme } from '../../../lib/themes';
+import { initialState as configInitialState, setConfig } from '../../../redux/configSlice';
+import reducers from '../../../redux/reducers/reducers';
+import store from '../../../redux/stores/store';
+import { enqueueConfigOperation } from '../../../stateless/configOperationQueue';
 import { TestContext } from '../../../test';
 import SettingsCluster from './SettingsCluster';
+import * as tagStorage from './useClusterTagStorage';
 
 const clusterName = 'my-cluster';
 const theme = createMuiTheme({ base: 'light', name: 'light' });
@@ -122,12 +131,51 @@ describe('SettingsCluster appearance controls', () => {
     mockState.clustersConf = {
       [clusterName]: {
         name: clusterName,
-        meta_data: { namespace: 'default', source: 'kubeconfig' },
+        meta_data: { namespace: 'default', source: 'kubeconfig', canRename: true },
       },
     };
   });
 
-  it('labels controls with their appearance subsection', () => {
+  it('keeps delete publication ahead of a queued save so the delayed response cannot undo tags', async () => {
+    mockState.electron = true;
+    mockState.clustersConf[clusterName].meta_data.source = 'dynamic_cluster';
+    const survivor = {
+      name: 'survivor',
+      auth_type: '',
+      meta_data: { extensions: { headlamp_info: { tags: { env: 'old' } } } },
+    };
+    let finish!: (config: { clusters: Record<string, typeof survivor> }) => void;
+    mockDeleteCluster.mockReturnValueOnce(new Promise(resolve => (finish = resolve)));
+    renderSettings();
+    await userEvent.click(screen.getByRole('button', { name: 'Remove Cluster' }));
+    await waitFor(() => expect(mockDeleteCluster).toHaveBeenCalledTimes(1));
+    const save = vi.fn(async () => {
+      expect(store.getState().config.clusters).toEqual({ survivor });
+      store.dispatch(
+        setConfig({
+          clusters: {
+            survivor: {
+              ...survivor,
+              meta_data: { extensions: { headlamp_info: { tags: { env: 'new' } } } },
+            },
+          },
+        })
+      );
+    });
+    const saving = enqueueConfigOperation(save);
+    expect(save).not.toHaveBeenCalled();
+    await act(async () => {
+      finish({ clusters: { survivor } });
+      await saving;
+    });
+    expect(
+      store.getState().config.clusters?.survivor.meta_data?.extensions?.headlamp_info?.tags
+    ).toEqual({ env: 'new' });
+    expect(store.getState().config.clusters).not.toHaveProperty(clusterName);
+    store.dispatch(setConfig({ clusters: null }));
+  });
+
+  it('tags controls with their appearance subsection', () => {
     renderSettings();
 
     expect(
@@ -194,7 +242,7 @@ describe('SettingsCluster appearance controls', () => {
   });
 });
 
-describe('SettingsCluster states and namespaces', () => {
+describe('SettingsCluster tags', () => {
   beforeEach(() => {
     localStorage.clear();
     mockDeleteCluster.mockReset();
@@ -204,6 +252,277 @@ describe('SettingsCluster states and namespaces', () => {
       [clusterName]: {
         name: clusterName,
         meta_data: { namespace: 'default', source: 'kubeconfig' },
+      },
+    };
+  });
+
+  afterEach(() => {
+    localStorage.clear();
+  });
+
+  function storedTags() {
+    return JSON.parse(localStorage.getItem(`cluster_settings.${clusterName}`) || '{}').tags;
+  }
+
+  it('saves edited tags', async () => {
+    renderSettings({ tags: { environment: 'production' } });
+
+    await userEvent.clear(screen.getByRole('textbox', { name: 'Tag value' }));
+    await userEvent.type(screen.getByRole('textbox', { name: 'Tag value' }), 'staging');
+    await userEvent.click(screen.getByRole('button', { name: 'Save tags' }));
+
+    expect(storedTags()).toEqual({ environment: 'staging' });
+  });
+
+  it('keeps unsaved tags when unrelated cluster metadata changes', async () => {
+    mockState.clustersConf[clusterName].meta_data.extensions = {
+      headlamp_info: { tags: { environment: 'production' } },
+    };
+    const { rerender } = renderSettings();
+    await userEvent.clear(screen.getByRole('textbox', { name: 'Tag value' }));
+    await userEvent.type(screen.getByRole('textbox', { name: 'Tag value' }), 'draft');
+    mockState.clustersConf = {
+      [clusterName]: JSON.parse(JSON.stringify(mockState.clustersConf[clusterName])),
+      other: { name: 'other', meta_data: { source: 'kubeconfig', namespace: 'changed' } },
+    };
+    rerender(
+      <TestContext urlSearchParams={{ c: clusterName }}>
+        <ThemeProvider theme={theme}>
+          <SettingsCluster />
+        </ThemeProvider>
+      </TestContext>
+    );
+    expect(screen.getByRole('textbox', { name: 'Tag value' })).toHaveValue('draft');
+    expect(screen.getByRole('button', { name: 'Save tags' })).toBeEnabled();
+    mockState.clustersConf = {
+      ...mockState.clustersConf,
+      [clusterName]: {
+        ...mockState.clustersConf[clusterName],
+        meta_data: {
+          extensions: { headlamp_info: { tags: { environment: 'updated' } } },
+        },
+      },
+    };
+    rerender(
+      <TestContext urlSearchParams={{ c: clusterName }}>
+        <ThemeProvider theme={theme}>
+          <SettingsCluster />
+        </ThemeProvider>
+      </TestContext>
+    );
+    expect(screen.getByRole('textbox', { name: 'Tag value' })).toHaveValue('updated');
+  });
+
+  it('refreshes a removed cross-tab override without discarding unrelated input drafts', async () => {
+    mockState.clustersConf[clusterName].meta_data.extensions = {
+      headlamp_info: { tags: { environment: 'context' } },
+    };
+    renderSettings({ tags: { environment: 'override' }, appearance: { accentColor: '#123456' } });
+    await userEvent.type(screen.getByRole('textbox', { name: 'Default namespace' }), 'draft');
+    act(() => {
+      storeClusterSettings(clusterName, { appearance: { accentColor: '#123456' } });
+      window.dispatchEvent(new StorageEvent('storage', { key: `cluster_settings.${clusterName}` }));
+    });
+    expect(screen.getByRole('textbox', { name: 'Tag value' })).toHaveValue('context');
+    expect(screen.getByRole('textbox', { name: 'Default namespace' })).toHaveValue('draft');
+    await userEvent.click(screen.getByRole('button', { name: 'Clear accent color' }));
+    expect(storedTags()).toBeUndefined();
+  });
+
+  it('disables all tag edits during a delayed save and unlocks the submitted draft on failure', async () => {
+    let finish!: (success: boolean) => void;
+    const pending = new Promise<boolean>(resolve => (finish = resolve));
+    const storage = vi.spyOn(tagStorage, 'useClusterTagStorage').mockImplementation(() => {
+      const [saving, setSaving] = useState(false);
+      return {
+        saving,
+        error: '',
+        helpText: '',
+        save: async () => {
+          setSaving(true);
+          const result = await pending;
+          setSaving(false);
+          return result;
+        },
+      };
+    });
+    try {
+      renderSettings({ tags: { environment: 'production' } });
+      await userEvent.clear(screen.getByRole('textbox', { name: 'Tag value' }));
+      await userEvent.type(screen.getByRole('textbox', { name: 'Tag value' }), 'submitted');
+      await userEvent.click(screen.getByRole('button', { name: 'Save tags' }));
+      expect(screen.getByRole('textbox', { name: 'Tag key' })).toBeDisabled();
+      expect(screen.getByRole('textbox', { name: 'Tag value' })).toBeDisabled();
+      expect(screen.getByRole('button', { name: 'Add tag' })).toBeDisabled();
+      expect(
+        screen.getByRole('button', { name: 'Remove tag environment=submitted' })
+      ).toBeDisabled();
+      await userEvent.type(screen.getByRole('textbox', { name: 'Tag value' }), 'lost');
+      await act(async () => {
+        finish(false);
+        await pending;
+      });
+      expect(screen.getByRole('textbox', { name: 'Tag value' })).toHaveValue('submitted');
+      expect(screen.getByRole('textbox', { name: 'Tag value' })).toBeEnabled();
+    } finally {
+      storage.mockRestore();
+    }
+  });
+
+  it.each(['clusterID', 'server', 'same-ID server', 'same-ID authentication'])(
+    'resets old tag drafts for a same-named replacement %s',
+    async field => {
+      mockState.clustersConf[clusterName] = {
+        name: clusterName,
+        server: 'https://first.example',
+        auth_type: '',
+        meta_data: {
+          source: field === 'server' ? 'dynamic_cluster' : 'kubeconfig',
+          clusterID: field === 'server' ? undefined : 'first+cluster',
+          extensions: { headlamp_info: { tags: { env: 'saved' } } },
+        },
+      };
+      const { rerender } = renderSettings();
+      await userEvent.clear(screen.getByRole('textbox', { name: 'Tag key' }));
+      mockState.clustersConf = {
+        [clusterName]: {
+          ...mockState.clustersConf[clusterName],
+          server: field.includes('server') ? 'https://second.example' : 'https://first.example',
+          auth_type: field === 'same-ID authentication' ? 'oidc' : '',
+          meta_data: {
+            ...mockState.clustersConf[clusterName].meta_data,
+            clusterID:
+              field === 'clusterID'
+                ? 'second+cluster'
+                : mockState.clustersConf[clusterName].meta_data.clusterID,
+          },
+        },
+      };
+      rerender(
+        <TestContext urlSearchParams={{ c: clusterName }}>
+          <ThemeProvider theme={theme}>
+            <SettingsCluster />
+          </ThemeProvider>
+        </TestContext>
+      );
+      expect(screen.getByRole('textbox', { name: 'Tag key' })).toHaveValue('env');
+      expect(screen.getByRole('textbox', { name: 'Tag value' })).toHaveValue('saved');
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'Save tags' })).toBeDisabled();
+    }
+  );
+
+  it('drops invalid editor rows when saved context tags are removed', async () => {
+    mockState.clustersConf[clusterName].meta_data.extensions = {
+      headlamp_info: { tags: { environment: 'production' } },
+    };
+    const { rerender } = renderSettings();
+    await userEvent.clear(screen.getByRole('textbox', { name: 'Tag key' }));
+    expect(screen.getByRole('alert')).toHaveTextContent('Every tag needs a key');
+    mockState.clustersConf = {
+      [clusterName]: {
+        ...mockState.clustersConf[clusterName],
+        meta_data: { extensions: { headlamp_info: { tags: {} } } },
+      },
+    };
+    rerender(
+      <TestContext urlSearchParams={{ c: clusterName }}>
+        <ThemeProvider theme={theme}>
+          <SettingsCluster />
+        </ThemeProvider>
+      </TestContext>
+    );
+    expect(screen.queryByRole('textbox', { name: 'Tag key' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Discard changes' })).toBeDisabled();
+  });
+
+  it('does not apply a completed tag save to another selected cluster', async () => {
+    let completeSave!: (saved: boolean) => void;
+    const pendingSave = new Promise<boolean>(resolve => {
+      completeSave = resolve;
+    });
+    const storage = vi.spyOn(tagStorage, 'useClusterTagStorage').mockReturnValue({
+      save: () => pendingSave,
+      saving: false,
+      error: '',
+      helpText: '',
+    });
+    const otherSettings = {
+      tags: { environment: 'other' },
+      appearance: { accentColor: '#123456' },
+    };
+    localStorage.setItem('cluster_settings.other-cluster', JSON.stringify(otherSettings));
+    mockState.clustersConf['other-cluster'] = {
+      name: 'other-cluster',
+      meta_data: { source: 'kubeconfig' },
+    };
+
+    try {
+      renderSettings({ tags: { environment: 'production' } });
+      await userEvent.clear(screen.getByRole('textbox', { name: 'Tag value' }));
+      await userEvent.type(screen.getByRole('textbox', { name: 'Tag value' }), 'staging');
+      await userEvent.click(screen.getByRole('button', { name: 'Save tags' }));
+      await userEvent.click(screen.getByRole('combobox'));
+      await userEvent.click(screen.getByRole('option', { name: 'other-cluster' }));
+      await waitFor(() =>
+        expect(screen.getByRole('textbox', { name: 'Tag value' })).toHaveValue('other')
+      );
+      await act(async () => {
+        completeSave(true);
+        await pendingSave;
+      });
+      expect(screen.getByRole('textbox', { name: 'Tag value' })).toHaveValue('other');
+      await userEvent.click(screen.getByRole('button', { name: 'Clear accent color' }));
+      expect(JSON.parse(localStorage.getItem('cluster_settings.other-cluster')!)).toMatchObject({
+        tags: otherSettings.tags,
+      });
+    } finally {
+      storage.mockRestore();
+    }
+  });
+
+  it('does not delete a saved label when its key is cleared', async () => {
+    renderSettings({ tags: { environment: 'production' } });
+
+    await userEvent.clear(screen.getByRole('textbox', { name: 'Tag key' }));
+
+    expect(screen.getByRole('alert')).toHaveTextContent('Every tag needs a key');
+    expect(screen.getByRole('button', { name: 'Save tags' })).toBeDisabled();
+    expect(storedTags()).toEqual({ environment: 'production' });
+
+    await userEvent.click(screen.getByRole('button', { name: 'Discard changes' }));
+
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(screen.getByRole('textbox', { name: 'Tag key' })).toHaveValue('environment');
+    expect(screen.getByRole('button', { name: 'Save tags' })).toBeDisabled();
+  });
+
+  it('discards a new row without a key, although the tags are unchanged', async () => {
+    renderSettings({ tags: { environment: 'production' } });
+
+    await userEvent.click(screen.getByRole('button', { name: 'Add tag' }));
+    const keys = screen.getAllByRole('textbox', { name: 'Tag key' });
+    await userEvent.clear(keys[keys.length - 1]);
+
+    expect(screen.getByRole('button', { name: 'Save tags' })).toBeDisabled();
+    await userEvent.click(screen.getByRole('button', { name: 'Discard changes' }));
+
+    expect(screen.getAllByRole('textbox', { name: 'Tag key' })).toHaveLength(1);
+    expect(screen.getByRole('button', { name: 'Discard changes' })).toBeDisabled();
+  });
+});
+
+describe('SettingsCluster states and namespaces', () => {
+  beforeEach(() => {
+    localStorage.clear();
+    mockDeleteCluster.mockReset();
+    mockState.activeCluster = clusterName;
+    mockState.electron = false;
+    mockState.clustersConf = {
+      [clusterName]: {
+        name: clusterName,
+        meta_data: { namespace: 'default', source: 'kubeconfig', canRename: true },
       },
     };
   });
@@ -275,6 +594,50 @@ describe('SettingsCluster states and namespaces', () => {
     expect(screen.getByText('zeta')).toBeInTheDocument();
   });
 
+  it('disables Add button and blocks Enter for empty or invalid allowed namespaces', async () => {
+    renderSettings({ allowedNamespaces: ['zeta'] });
+    const input = screen.getByRole('textbox', { name: 'Allowed namespaces' });
+    const addButton = screen.getByRole('button', { name: 'Add namespace' });
+
+    // Empty input: Add button is disabled, and Enter does not add an empty chip
+    expect(addButton).toBeDisabled();
+    await userEvent.click(input);
+    await userEvent.keyboard('{Enter}');
+    expect(
+      JSON.parse(localStorage.getItem(`cluster_settings.${clusterName}`) || '{}')
+    ).not.toMatchObject({ allowedNamespaces: expect.arrayContaining(['']) });
+
+    // Invalid input: shows error, Add button is disabled, and Enter does not add it
+    await userEvent.type(input, 'INVALID_NAME');
+    expect(input).toHaveAttribute('aria-invalid', 'true');
+    expect(addButton).toBeDisabled();
+    await userEvent.keyboard('{Enter}');
+    expect(screen.queryByText('INVALID_NAME')).not.toBeInTheDocument();
+    expect(
+      JSON.parse(localStorage.getItem(`cluster_settings.${clusterName}`) || '{}')
+    ).not.toMatchObject({ allowedNamespaces: expect.arrayContaining(['INVALID_NAME']) });
+  });
+
+  it('clears typed namespaces when switching to another cluster', async () => {
+    mockState.clustersConf['other-cluster'] = {
+      name: 'other-cluster',
+      meta_data: { namespace: 'default', source: 'kubeconfig' },
+    };
+    renderSettings();
+    const allowedInput = screen.getByRole('textbox', { name: 'Allowed namespaces' });
+    const defaultInput = screen.getByRole('textbox', { name: 'Default namespace' });
+
+    await userEvent.type(allowedInput, 'team-a');
+    // Never a valid namespace, so it isn't saved and only the cluster switch can reset it.
+    await userEvent.type(defaultInput, 'Team');
+    await userEvent.click(screen.getByRole('combobox', { name: 'Cluster' }));
+    await userEvent.click(await screen.findByRole('option', { name: 'other-cluster' }));
+
+    await waitFor(() => expect(allowedInput).toHaveValue(''));
+    expect(defaultInput).toHaveValue('');
+    expect(screen.getByRole('button', { name: 'Add namespace' })).toBeDisabled();
+  });
+
   it('renders Electron controls and removes a dynamic cluster', async () => {
     mockState.electron = true;
     mockState.clustersConf[clusterName].meta_data.source = 'dynamic_cluster';
@@ -284,6 +647,37 @@ describe('SettingsCluster states and namespaces', () => {
     expect(screen.getByText('Cluster name editor')).toBeInTheDocument();
     await userEvent.click(screen.getByRole('button', { name: 'Remove Cluster' }));
     await waitFor(() => expect(mockDeleteCluster).toHaveBeenCalledWith(clusterName));
+  });
+
+  it.each(['cluster_inventory', 'kubeconfig', 'incluster'])(
+    'does not offer renaming for a %s connection without a persistence origin',
+    source => {
+      mockState.electron = true;
+      mockState.clustersConf[clusterName].meta_data = { source, canRename: false };
+      renderSettings();
+
+      expect(screen.queryByText('Cluster name editor')).not.toBeInTheDocument();
+    }
+  );
+
+  it('offers renaming for a connection persisted in IndexedDB', () => {
+    mockState.electron = true;
+    mockState.clustersConf[clusterName].meta_data.canRename = false;
+    const store = configureStore({
+      reducer: reducers,
+      preloadedState: {
+        config: { ...configInitialState, statelessClusters: mockState.clustersConf },
+      },
+    });
+    render(
+      <TestContext store={store} urlSearchParams={{ c: clusterName }}>
+        <ThemeProvider theme={theme}>
+          <SettingsCluster />
+        </ThemeProvider>
+      </TestContext>
+    );
+
+    expect(screen.getByText('Cluster name editor')).toBeInTheDocument();
   });
 
   it('handles a dynamic cluster removal failure', async () => {

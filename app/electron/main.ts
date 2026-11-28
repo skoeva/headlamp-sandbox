@@ -69,6 +69,8 @@ import {
   defaultUserPluginsDir,
   getMatchingExtraFiles,
   getPluginBinDirectories,
+  isExistingDirectory,
+  isPathWithinDirectory,
   PluginManager,
   setAppConfigDirName,
 } from './plugin-management';
@@ -93,6 +95,7 @@ import {
   isTrayIconEnabled,
   setTrayIconEnabled,
 } from './tray';
+import { isAppUrl, isSafeExternalUrl } from './urlSafety';
 import windowSize from './windowSize';
 import {
   clampZoom,
@@ -627,14 +630,16 @@ class PluginManagerEventListeners {
       progress: { type: 'info', message: 'uninstalling plugin' },
     };
 
-    const installedPlugin = PluginManager.list(destinationFolder)?.find(
-      plugin => plugin.pluginName === pluginName
+    PluginManager.uninstall(
+      pluginName,
+      destinationFolder,
+      progress => {
+        updateCache(progress);
+      },
+      // Clear the consents of the bundle being removed while it can still be found: if saving
+      // them fails, the uninstall stops and can be retried.
+      bundleName => removeRunCmdConsent(pluginName, bundleName)
     );
-    removeRunCmdConsent(pluginName, installedPlugin?.folderName);
-
-    PluginManager.uninstall(pluginName, destinationFolder, progress => {
-      updateCache(progress);
-    });
   }
 
   /**
@@ -1286,6 +1291,7 @@ function setMenu(appWindow: BrowserWindow | null, newAppMenu: AppMenu[] = []) {
   try {
     const menuTemplate: (MenuItemConstructorOptions | MenuItem)[] =
       menusToTemplate(appWindow, appMenu, loadFullMenu, {
+        startUrl,
         openExternal: url => shell.openExternal(url),
         openAboutDialog: () => appWindow?.webContents.send('open-about-dialog'),
         adjustZoom,
@@ -1738,12 +1744,15 @@ function startElectron() {
     setMenu(mainWindow, currentMenu);
 
     mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-      // allow all urls starting with app startUrl to open in electron
-      if (url.startsWith(startUrl)) {
+      // allow urls belonging to the app's own frontend to open in electron
+      if (isAppUrl(url, startUrl)) {
         return { action: 'allow' };
       }
-      // otherwise open url in a browser and prevent default
-      shell.openExternal(url);
+      // otherwise open url in a browser and prevent default, but only for
+      // safe schemes; renderer-supplied custom schemes never reach the OS.
+      if (isSafeExternalUrl(url)) {
+        shell.openExternal(url);
+      }
       return { action: 'deny' };
     });
 
@@ -1789,6 +1798,8 @@ function startElectron() {
 
     mainWindow.webContents.on('dom-ready', () => {
       const defaultMenu = getDefaultAppMenu();
+      loadFullMenu = false;
+      setMenu(mainWindow, defaultMenu);
       const currentMenu = JSON.parse(JSON.stringify(defaultMenu));
       mainWindow?.webContents.send('currentMenu', currentMenu);
     });
@@ -1831,12 +1842,14 @@ function startElectron() {
     to the default browser
     */
     mainWindow.webContents.on('will-navigate', (event, encodedUrl) => {
-      const url = decodeURI(encodedUrl);
-      if (url.startsWith(startUrl)) {
+      if (isAppUrl(encodedUrl, startUrl)) {
         return;
       }
       event.preventDefault();
-      shell.openExternal(url);
+      // Only safe schemes reach the OS shell opener.
+      if (isSafeExternalUrl(encodedUrl)) {
+        shell.openExternal(encodedUrl);
+      }
     });
 
     i18n.on('languageChanged', () => {
@@ -1946,21 +1959,50 @@ function startElectron() {
         if (!isFromMainWindowFrame(event, mainWindow)) {
           return;
         }
-        let folderPath: string | null = null;
+
+        // The IPC payload comes from the renderer and isn't trusted.
+        if (!pluginInfo || typeof pluginInfo.folderName !== 'string') {
+          return;
+        }
+
+        let baseDir: string | null = null;
 
         if (pluginInfo.type === 'user') {
-          folderPath = path.join(defaultUserPluginsDir(), pluginInfo.folderName);
+          baseDir = defaultUserPluginsDir();
         } else if (pluginInfo.type === 'development') {
-          folderPath = path.join(defaultPluginsDir(), pluginInfo.folderName);
+          baseDir = defaultPluginsDir();
         } else if (pluginInfo.type === 'shipped') {
-          folderPath = path.join(process.resourcesPath, '.plugins', pluginInfo.folderName);
+          baseDir = path.join(process.resourcesPath, '.plugins');
         }
 
-        if (folderPath) {
-          shell.openPath(folderPath).catch((err: Error) => {
-            console.error('Failed to open plugin folder:', err);
-          });
+        if (!baseDir) {
+          return;
         }
+
+        const folderPath = path.join(baseDir, pluginInfo.folderName);
+
+        // pluginInfo.folderName comes from the renderer and isn't trusted, so
+        // make sure the resolved path still lives inside the expected plugin
+        // directory before revealing it. Without this, a folderName like
+        // "../../../../etc" resolves outside baseDir entirely, and the reveal
+        // would point a file manager window at an arbitrary location.
+        if (!isPathWithinDirectory(baseDir, folderPath)) {
+          console.error(`Refusing to open plugin folder outside of ${baseDir}: ${folderPath}`);
+          return;
+        }
+
+        // Staying inside the plugins directory is not enough: a folderName like
+        // "some-plugin/bin/tool.exe" resolves to a file in there, and revealing
+        // a file selects it inside its parent folder rather than opening the
+        // plugin's own. This channel reveals plugin folders, so refuse anything
+        // that is not an existing directory.
+        if (!isExistingDirectory(folderPath)) {
+          console.error(`Refusing to open plugin path that is not a directory: ${folderPath}`);
+          return;
+        }
+
+        // Reveal the plugin directory in the OS file manager without opening or launching it.
+        shell.showItemInFolder(folderPath);
       }
     );
 

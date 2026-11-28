@@ -84,6 +84,10 @@ export type ResourceTableColumn<RowItem> = {
    * @default true
    **/
   sort?: boolean | ((a: RowItem, b: RowItem) => number);
+  /**
+   * Sort descending on the first click. By default only columns whose values are numbers do.
+   */
+  sortDescFirst?: boolean;
   /** Change how filtering behaves, by default it will just search the text value */
   filterVariant?: TableColumn<any>['filterVariant'];
   disableFiltering?: boolean;
@@ -175,12 +179,26 @@ export interface ResourceTableProps<RowItem> {
    * or undefined to fall back to the default search.
    */
   searchFilter?: (item: RowItem, search: string) => boolean | undefined;
+  /**
+   * When true, the table's default row filtering ignores the global namespace
+   * filter, so a stale/unrelated namespace selection elsewhere in the app can't
+   * hide this table's rows. Textual/search filtering is unaffected. Has no effect
+   * on cluster-scoped rows (items without metadata.namespace), and is ignored if
+   * a custom filterFunction is provided.
+   */
+  noNamespaceFilter?: boolean;
   /** Display an error message. Table will be hidden even if data is present */
   errorMessage?: string | null;
   /** Display an errors */
   errors?: ApiError[] | null;
   /** State of the Table (page, rows per page) is reflected in the url */
   reflectInURL?: string | boolean;
+  /**
+   * Optional quick-action controls (e.g. "Refresh", "Create <Kind>") shown
+   * below the empty message when the table has no data. Pass `null` to
+   * explicitly suppress the default that `ResourceListView` provides.
+   */
+  emptyActions?: ReactNode;
 }
 
 export interface ResourceTableFromResourceClassProps<KubeClass extends KubeObjectClass>
@@ -263,8 +281,8 @@ function initColumnVisibilityState(columns: ResourceTableProps<any>['columns'], 
     }
     if (typeof col === 'string') return;
 
-    if ('show' in col) {
-      visibility[col.id ?? String(index)] = col.show ?? true;
+    if (col.show === false) {
+      visibility[col.id ?? String(index)] = false;
     }
   });
 
@@ -339,6 +357,7 @@ function ResourceTableContent<RowItem extends KubeObject>(props: ResourceTablePr
     hideColumns = [],
     filterFunction,
     searchFilter,
+    noNamespaceFilter,
     errorMessage,
     reflectInURL,
     data,
@@ -347,13 +366,14 @@ function ResourceTableContent<RowItem extends KubeObject>(props: ResourceTablePr
     enableRowActions = false,
     enableRowSelection = false,
     errors,
+    emptyActions,
   } = props;
   const { t } = useTranslation(['glossary', 'translation']);
   const theme = useTheme();
   const storeRowsPerPageOptions = useSettings('tableRowsPerPageOptions');
   const clusters = useSelectedClusters();
   const tableProcessors = useTypedSelector(state => state.resourceTable.tableColumnsProcessors);
-  const defaultFilterFunc = useFilterFunc();
+  const defaultFilterFunc = useFilterFunc(undefined, noNamespaceFilter);
   const [columnVisibility, setColumnVisibility] = useState(() =>
     initColumnVisibilityState(columns, id)
   );
@@ -447,6 +467,7 @@ function ResourceTableContent<RowItem extends KubeObject>(props: ResourceTablePr
             filterVariant: column.filterVariant,
             enableMultiSort: !!sort,
             enableSorting: !!sort,
+            sortDescFirst: column.sortDescFirst,
             enableColumnFilter: !column.disableFiltering,
             muiTableBodyCellProps: {
               ...column.cellProps,
@@ -653,7 +674,7 @@ function ResourceTableContent<RowItem extends KubeObject>(props: ResourceTablePr
                 <ListItemIcon>
                   <Icon icon={meta.icon} width="20" />
                 </ListItemIcon>
-                <ListItemText>{t(meta.labelKey)}</ListItemText>
+                <ListItemText>{t(meta.labelKey, { ns: ['glossary', 'translation'] })}</ListItemText>
               </MenuItem>
             ))}
           </React.Fragment>
@@ -780,6 +801,7 @@ function ResourceTableContent<RowItem extends KubeObject>(props: ResourceTablePr
         globalFilterFn="kubeObjectSearch"
         filterFunction={filterFunc}
         getRowId={getResourceRowId}
+        emptyActions={errorMessage || (errors && errors.length) ? undefined : emptyActions}
       />
     </>
   );

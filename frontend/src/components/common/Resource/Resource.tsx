@@ -50,7 +50,7 @@ import Pod, { KubePod, KubeVolume } from '../../../lib/k8s/pod';
 import { METRIC_REFETCH_INTERVAL_MS, PodMetrics } from '../../../lib/k8s/PodMetrics';
 import Secret from '../../../lib/k8s/secret';
 import StatefulSet from '../../../lib/k8s/statefulSet';
-import { RouteURLProps } from '../../../lib/router';
+import type { RouteURLProps } from '../../../lib/router/createRouteURL';
 import { createRouteURL } from '../../../lib/router/createRouteURL';
 import { divideK8sResources } from '../../../lib/units';
 import { localeDate, useId } from '../../../lib/util';
@@ -67,15 +67,17 @@ import {
 import { JobsListRenderer } from '../../job/List';
 import { PodListProps, PodListRenderer } from '../../pod/List';
 import { StatefulSetsListRenderer } from '../../statefulset/List';
-import { LightTooltip, Loader, ObjectEventList } from '..';
 import BackLink from '../BackLink';
 import Empty from '../EmptyContent';
 import ErrorBoundary from '../ErrorBoundary';
 import InnerTable from '../InnerTable';
 import { DateLabel, HoverInfoLabel, StatusLabel, StatusLabelProps, ValueLabel } from '../Label';
 import Link, { LinkProps } from '../Link';
+import Loader from '../Loader';
+import ObjectEventList from '../ObjectEventList';
 import { useObjectEvents } from '../ObjectEventList';
 import PasswordForm from '../PasswordForm';
+import { LightTooltip } from '../Tooltip';
 import { metadataStyles } from '.';
 import A8RInfo from './A8RInfo';
 import { MainInfoSection, MainInfoSectionProps } from './MainInfoSection/MainInfoSection';
@@ -676,7 +678,7 @@ export function ConditionsTable(props: ConditionsTableProps) {
   function getColumns() {
     const cols: {
       label: string;
-      getter: (arg: KubeCondition) => void;
+      getter: (arg: KubeCondition) => React.ReactNode;
       hide?: boolean;
     }[] = [
       {
@@ -689,12 +691,21 @@ export function ConditionsTable(props: ConditionsTableProps) {
       },
       {
         label: t('Last Transition'),
-        getter: condition => <DateLabel date={condition.lastTransitionTime as string} />,
+        getter: condition =>
+          condition.lastTransitionTime ? (
+            <DateLabel date={condition.lastTransitionTime as string} />
+          ) : (
+            '-'
+          ),
       },
       {
         label: t('Last Update'),
         getter: condition =>
-          condition.lastUpdateTime ? <DateLabel date={condition.lastUpdateTime as string} /> : '-',
+          condition.lastUpdateTime !== null && condition.lastUpdateTime !== undefined ? (
+            <DateLabel date={condition.lastUpdateTime} />
+          ) : (
+            '-'
+          ),
         hide: !showLastUpdate,
       },
       {
@@ -763,9 +774,11 @@ export function extractEnvVarReferences(container: KubeContainer): EnvVarReferen
 
   // Process env variables
   container?.env?.forEach(item => {
-    if (item.value) {
-      refs.push({ name: item.name, type: 'value', value: item.value });
-    } else if (item.valueFrom) {
+    // Without valueFrom an env var is a plain value, and that value can be empty. The API leaves
+    // out an empty value, so a missing one is an empty string as well.
+    if (!item.valueFrom) {
+      refs.push({ name: item.name, type: 'value', value: item.value ?? '' });
+    } else {
       const vf = item.valueFrom;
       if (vf.secretKeyRef) {
         refs.push({
@@ -2077,6 +2090,8 @@ export function ConditionsSection(props: { resource: KubeObjectInterface | null 
 
 export interface VolumeSectionProps {
   resource: KubeObjectInterface | null;
+  /** Cluster the resource belongs to, so volume links open in that cluster. */
+  cluster?: string;
 }
 
 export interface VolumeRowsProps {
@@ -2096,7 +2111,7 @@ export interface VolumePrints {
 
 export function VolumeSection(props: VolumeSectionProps) {
   const { t } = useTranslation('glossary');
-  const { resource } = props;
+  const { resource, cluster } = props;
   const volumes = resource?.spec?.volumes;
 
   if (!volumes) {
@@ -2133,6 +2148,7 @@ export function VolumeSection(props: VolumeSectionProps) {
               <Link
                 routeName={volumeRoute}
                 params={{ namespace: volumeNamespace, name: detailName }}
+                activeCluster={cluster}
               >
                 {volumeName}
               </Link>

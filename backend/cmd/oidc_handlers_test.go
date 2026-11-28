@@ -232,6 +232,13 @@ func withAccessToken() oidcTestOption {
 	return func(c *HeadlampConfig) { c.OidcUseAccessToken = true }
 }
 
+func withValidatorOverrides(issuerURL, clientID string) oidcTestOption {
+	return func(c *HeadlampConfig) {
+		c.OidcValidatorIdpIssuerURL = issuerURL
+		c.OidcValidatorClientID = clientID
+	}
+}
+
 // withDevMode enables the DevMode redirect branch of the callback.
 func withDevMode() oidcTestOption {
 	return func(c *HeadlampConfig) { c.DevMode = true }
@@ -247,6 +254,14 @@ func withBaseURL(u string) oidcTestOption {
 // kubeconfig context whose IdP issuer points at the supplied mock server.
 // Returns the handler and the cluster name registered.
 func newOIDCTestHandler(t *testing.T, oidcSrv *oidcTestServer, opts ...oidcTestOption) (http.Handler, string) {
+	t.Helper()
+
+	c, clusterName := newOIDCTestConfig(t, oidcSrv, opts...)
+
+	return createHeadlampHandler(newTestHandlerCtx(t), c), clusterName
+}
+
+func newOIDCTestConfig(t *testing.T, oidcSrv *oidcTestServer, opts ...oidcTestOption) (*HeadlampConfig, string) {
 	t.Helper()
 
 	const clusterName = "oidc-char-test"
@@ -285,7 +300,7 @@ func newOIDCTestHandler(t *testing.T, oidcSrv *oidcTestServer, opts ...oidcTestO
 		opt(c)
 	}
 
-	return createHeadlampHandler(newTestHandlerCtx(t), c), clusterName
+	return c, clusterName
 }
 
 // driveOIDCStart calls /oidc?cluster=<cluster> against the supplied handler
@@ -728,6 +743,89 @@ func TestOIDCCallback_Success(t *testing.T) {
 		"non-DevMode, empty BaseURL redirects to /auth?cluster=<cluster>")
 }
 
+func TestOIDCRefreshAndMeWithBaseURL(t *testing.T) {
+	const baseURL = "/dev/internal/headlamp"
+
+	srv := newOIDCTestServer(t, nil)
+	tokenCache := cache.New[interface{}]()
+	config, cluster := newOIDCTestConfig(t, srv,
+		withBaseURL(baseURL),
+		withCache(tokenCache),
+		withAccessToken(),
+	)
+	config.SessionTTL = 3600
+
+	expiredToken, renewedToken := configureBaseURLRefreshTokens(t, srv, tokenCache)
+	handler := config.OIDCTokenRefreshMiddleware(
+		createHeadlampHandler(newTestHandlerCtx(t), config),
+	)
+	req := httptest.NewRequestWithContext(
+		t.Context(), http.MethodGet, baseURL+"/clusters/"+cluster+"/me", nil,
+	)
+	req.AddCookie(&http.Cookie{
+		Name:     "headlamp-auth-" + auth.SanitizeClusterName(cluster) + ".0",
+		Value:    expiredToken,
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteStrictMode,
+	})
+
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+
+	var got struct {
+		Username string `json:"username"`
+	}
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &got))
+	assert.Equal(t, "alice", got.Username)
+
+	var refreshedCookie *http.Cookie
+
+	for _, cookie := range rr.Result().Cookies() {
+		if cookie.Name == "headlamp-auth-"+auth.SanitizeClusterName(cluster)+".0" &&
+			cookie.Value == renewedToken {
+			refreshedCookie = cookie
+			break
+		}
+	}
+
+	require.NotNil(t, refreshedCookie, "renewed auth cookie was not set")
+	assert.Equal(t, baseURL+"/clusters/"+cluster, refreshedCookie.Path)
+}
+
+func configureBaseURLRefreshTokens(
+	t *testing.T, srv *oidcTestServer, tokenCache cache.Cache[interface{}],
+) (string, string) {
+	t.Helper()
+
+	expiredToken := srv.signToken(t, map[string]any{
+		"exp": float64(time.Now().Add(-time.Hour).Unix()),
+	})
+	renewedToken := srv.signToken(t, map[string]any{
+		"preferred_username": "alice",
+		"email":              "alice@example.com",
+		"groups":             []string{"dev"},
+	})
+	srv.setTokenHandler(func(w http.ResponseWriter, r *http.Request) {
+		require.NoError(t, r.ParseForm())
+		require.Equal(t, "refresh_token", r.PostForm.Get("grant_type"))
+		require.Equal(t, "refresh-user-token", r.PostForm.Get("refresh_token"))
+		w.Header().Set("Content-Type", "application/json")
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+			"access_token":  renewedToken,
+			"token_type":    "Bearer",
+			"refresh_token": "new-refresh-token",
+			"expires_in":    3600,
+		}))
+	})
+
+	require.NoError(t, tokenCache.Set(context.Background(), "oidc-token-"+expiredToken, "refresh-user-token"))
+
+	return expiredToken, renewedToken
+}
+
 // TestOIDCCallback_CachesRefreshToken characterizes where the callback stores
 // the refresh token: keyed by the raw user token, so a later refresh can find
 // it (see OIDCTokenRefreshMiddleware).
@@ -807,8 +905,8 @@ func TestOIDCCallback_VerificationFailure(t *testing.T) {
 // TestOIDCCallback_UsesAccessTokenWhenConfigured characterizes OidcUseAccessToken.
 //
 // The callback applies ID-token verification to the selected value, so this
-// fixture uses a second signed JWT. Opaque access-token support is tracked
-// by #6998.
+// fixture uses a second signed JWT. Opaque access tokens are covered by
+// TestOIDCCallback_VerifiesIDTokenForOpaqueAccessToken (#6998/#7598).
 func TestOIDCCallback_UsesAccessTokenWhenConfigured(t *testing.T) {
 	srv := newOIDCTestServer(t, nil)
 	handler, cluster := newOIDCTestHandler(t, srv, withAccessToken())
@@ -1222,4 +1320,164 @@ func TestOIDCCallback_RedirectTarget(t *testing.T) {
 			assert.Equal(t, tc.want, rr.Header().Get("Location"))
 		})
 	}
+}
+
+// TestOIDCCallback_VerifiesIDTokenForOpaqueAccessToken covers #6998/#7598:
+// an opaque access token cannot be verified, so the id_token is the login
+// proof while the access token remains the credential for the cluster.
+func TestOIDCCallback_VerifiesIDTokenForOpaqueAccessToken(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		accessToken string
+	}{
+		{"opaque", "opaque-access"},
+		{"opaque with dots", "access.token.with.dots"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := newOIDCTestServer(t, nil)
+			handler, cluster := newOIDCTestHandler(t, srv, withAccessToken())
+
+			idToken := srv.signToken(t, nil)
+
+			srv.setTokenHandler(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+
+				_, _ = io.WriteString(w, `{"access_token":"`+tt.accessToken+`","token_type":"Bearer",`+
+					`"refresh_token":"refresh-abc","id_token":"`+idToken+`"}`)
+			})
+
+			state := extractState(t, driveOIDCStart(t, handler, cluster))
+			rr := driveOIDCCallback(t, handler, state)
+
+			require.Equal(t, http.StatusSeeOther, rr.Code, "body=%q", rr.Body.String())
+			assert.Equal(t, tt.accessToken, authCookieValue(t, rr, cluster),
+				"the access token should remain the cluster credential")
+		})
+	}
+}
+
+func TestOIDCCallback_RejectsOpaqueAccessTokenWithoutIDToken(t *testing.T) {
+	srv := newOIDCTestServer(t, nil)
+	handler, cluster := newOIDCTestHandler(t, srv, withAccessToken())
+
+	srv.setTokenHandler(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		_, _ = io.WriteString(w, `{"access_token":"opaque-access","token_type":"Bearer"}`)
+	})
+
+	state := extractState(t, driveOIDCStart(t, handler, cluster))
+	rr := driveOIDCCallback(t, handler, state)
+
+	assert.Equal(t, http.StatusInternalServerError, rr.Code)
+	assert.Contains(t, rr.Body.String(), "No id_token field in oauth2 token")
+	assertNoOIDCAuthCookie(t, rr)
+}
+
+func TestOIDCCallback_RejectsUnverifiableIDToken(t *testing.T) {
+	srv := newOIDCTestServer(t, nil)
+	handler, cluster := newOIDCTestHandler(t, srv, withAccessToken())
+
+	otherKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+
+	claims := fmt.Sprintf(
+		`{"iss":%q,"aud":"test-client-id","sub":"test-subject","exp":%s,"iat":%s}`,
+		srv.URL(),
+		strconv.FormatInt(time.Now().Add(time.Hour).Unix(), 10),
+		strconv.FormatInt(time.Now().Unix(), 10),
+	)
+	badSignature := oidctest.SignIDToken(otherKey, testKeyID, oidc.RS256, claims)
+	expired := srv.signToken(t, map[string]any{"exp": time.Now().Add(-time.Hour).Unix()})
+
+	for _, tt := range []struct {
+		name    string
+		idToken string
+	}{
+		{"bad signature", badSignature},
+		{"expired", expired},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			srv.setTokenHandler(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+
+				_, _ = io.WriteString(w, `{"access_token":"opaque-access","token_type":"Bearer",`+
+					`"refresh_token":"refresh-abc","id_token":"`+tt.idToken+`"}`)
+			})
+
+			state := extractState(t, driveOIDCStart(t, handler, cluster))
+			rr := driveOIDCCallback(t, handler, state)
+
+			require.Equal(t, http.StatusInternalServerError, rr.Code)
+			assert.Contains(t, rr.Body.String(), "Failed to verify ID Token")
+			assertNoOIDCAuthCookie(t, rr)
+		})
+	}
+}
+
+func TestOIDCCallback_DoesNotFallBackWhenAccessTokenVerificationFails(t *testing.T) {
+	srv := newOIDCTestServer(t, nil)
+	handler, cluster := newOIDCTestHandler(t, srv, withAccessToken())
+
+	idToken := srv.signToken(t, map[string]any{"sub": "id-token-subject"})
+
+	otherKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+
+	claims := fmt.Sprintf(
+		`{"iss":%q,"aud":"test-client-id","sub":"access-token-subject","exp":%s,"iat":%s}`,
+		srv.URL(),
+		strconv.FormatInt(time.Now().Add(time.Hour).Unix(), 10),
+		strconv.FormatInt(time.Now().Unix(), 10),
+	)
+	badAccessToken := oidctest.SignIDToken(otherKey, testKeyID, oidc.RS256, claims)
+
+	srv.setTokenHandler(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		_, _ = io.WriteString(w, `{"access_token":"`+badAccessToken+`","token_type":"Bearer",`+
+			`"refresh_token":"refresh-abc","id_token":"`+idToken+`"}`)
+	})
+
+	state := extractState(t, driveOIDCStart(t, handler, cluster))
+	rr := driveOIDCCallback(t, handler, state)
+
+	require.Equal(t, http.StatusInternalServerError, rr.Code)
+	assert.Contains(t, rr.Body.String(), "Failed to verify ID Token")
+	assertNoOIDCAuthCookie(t, rr)
+}
+
+// TestOIDCCallback_VerifiesAccessTokenWithValidatorOverrides keeps the
+// documented Azure Entra ID / AKS configuration working: with validator
+// overrides the JWT access token is verified and forwarded to the cluster.
+func TestOIDCCallback_VerifiesAccessTokenWithValidatorOverrides(t *testing.T) {
+	const (
+		validatorIssuer   = "https://sts.windows.net/test-tenant/"
+		validatorClientID = "test-resource-client-id"
+	)
+
+	srv := newOIDCTestServer(t, nil)
+	discovery := newOIDCIssuerOverrideServer(t, srv, validatorIssuer)
+	handler, cluster := newOIDCTestHandler(t, discovery,
+		withAccessToken(), withValidatorOverrides(validatorIssuer, validatorClientID))
+
+	accessToken := srv.signToken(t, map[string]any{
+		"iss": validatorIssuer,
+		"aud": validatorClientID,
+	})
+	idToken := srv.signToken(t, nil)
+
+	srv.setTokenHandler(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		_, _ = io.WriteString(w, `{"access_token":"`+accessToken+`","token_type":"Bearer",`+
+			`"refresh_token":"refresh-abc","id_token":"`+idToken+`"}`)
+	})
+
+	state := extractState(t, driveOIDCStart(t, handler, cluster))
+	rr := driveOIDCCallback(t, handler, state)
+
+	require.Equal(t, http.StatusSeeOther, rr.Code, "body=%q", rr.Body.String())
+	assert.Equal(t, accessToken, authCookieValue(t, rr, cluster),
+		"the validated access token should remain the cluster credential")
 }

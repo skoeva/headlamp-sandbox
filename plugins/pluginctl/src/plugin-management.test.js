@@ -163,3 +163,219 @@ describe('validateArchiveURL', () => {
     expect(validateArchiveURL('https://gitlab.com/owner/repo/invalid/path')).toBe(false);
   });
 });
+
+describe('normalizeChecksum', () => {
+  const hex = 'a3b4c5d6e7f8a3b4c5d6e7f8a3b4c5d6e7f8a3b4c5d6e7f8a3b4c5d6e7f80000';
+
+  test('accepts lowercase and uppercase prefixes', () => {
+    expect(pluginManagement.normalizeChecksum(`sha256:${hex}`)).toBe(hex);
+    expect(pluginManagement.normalizeChecksum(`SHA256:${hex}`)).toBe(hex);
+    expect(pluginManagement.normalizeChecksum(`Sha256:${hex}`)).toBe(hex);
+  });
+
+  test('accepts a digest without a prefix', () => {
+    expect(pluginManagement.normalizeChecksum(hex)).toBe(hex);
+  });
+
+  test('lowercases uppercase hex, as printed by Get-FileHash', () => {
+    expect(pluginManagement.normalizeChecksum(`SHA256:${hex.toUpperCase()}`)).toBe(hex);
+  });
+
+  test('trims surrounding whitespace', () => {
+    expect(pluginManagement.normalizeChecksum(`  SHA256:${hex}\n`)).toBe(hex);
+  });
+
+  test('rejects values that are not a SHA-256 hex digest', () => {
+    expect(() => pluginManagement.normalizeChecksum('sha256:dummy')).toThrow(
+      'Invalid plugin/archive-checksum'
+    );
+    expect(() => pluginManagement.normalizeChecksum(`sha256:${hex}00`)).toThrow(
+      'Invalid plugin/archive-checksum'
+    );
+    expect(() => pluginManagement.normalizeChecksum('md5:d41d8cd98f00b204e9800998ecf8427e')).toThrow(
+      'Invalid plugin/archive-checksum'
+    );
+  });
+});
+
+describe('install with an uppercase archive-checksum', () => {
+  const crypto = require('crypto');
+  const tar = require('tar');
+  const archiveURL =
+    'https://github.com/example/checksum-plugin/releases/download/v1.0.0/checksum-plugin-1.0.0.tar.gz';
+  const originalFetch = global.fetch;
+  let workDir;
+  let tarball;
+
+  beforeAll(async () => {
+    workDir = tmp.dirSync({ unsafeCleanup: true }).name;
+    const pkgDir = path.join(workDir, 'checksum-plugin');
+    fs.mkdirSync(pkgDir);
+    fs.writeFileSync(path.join(pkgDir, 'main.js'), 'console.log("checksum plugin");\n');
+    fs.writeFileSync(
+      path.join(pkgDir, 'package.json'),
+      JSON.stringify({ name: 'checksum-plugin', version: '1.0.0' })
+    );
+    const tarballPath = path.join(workDir, 'checksum-plugin-1.0.0.tar.gz');
+    await tar.c({ gzip: true, file: tarballPath, cwd: workDir }, ['checksum-plugin']);
+    tarball = fs.readFileSync(tarballPath);
+  });
+
+  afterAll(() => {
+    global.fetch = originalFetch;
+    fs.rmSync(workDir, { recursive: true, force: true });
+  });
+
+  function mockArtifactHub(checksumAnnotation) {
+    global.fetch = jest.fn(async url => {
+      if (url.startsWith('https://artifacthub.io/api/v1/packages/headlamp/')) {
+        return new Response(
+          JSON.stringify({
+            name: 'checksum-plugin',
+            display_name: 'Checksum Plugin',
+            version: '1.0.0',
+            repository: { name: 'checksum-repo' },
+            data: {
+              'headlamp/plugin/archive-url': archiveURL,
+              'headlamp/plugin/archive-checksum': checksumAnnotation,
+            },
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      if (url === archiveURL) {
+        return new Response(tarball, { status: 200 });
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    });
+  }
+
+  test('installs when the checksum is uppercase hex', async () => {
+    const hex = crypto.createHash('sha256').update(tarball).digest('hex');
+    mockArtifactHub(`SHA256:${hex.toUpperCase()}`);
+    const destDir = tmp.dirSync({ unsafeCleanup: true }).name;
+    try {
+      await PluginManager.install(
+        'https://artifacthub.io/packages/headlamp/checksum-repo/checksum-plugin',
+        destDir,
+        '',
+        null
+      );
+      expect(fs.existsSync(path.join(destDir, 'checksum-plugin', 'main.js'))).toBe(true);
+    } finally {
+      fs.rmSync(destDir, { recursive: true, force: true });
+    }
+  });
+
+  test('still rejects a checksum that does not match', async () => {
+    mockArtifactHub(`SHA256:${'0'.repeat(64)}`);
+    const destDir = tmp.dirSync({ unsafeCleanup: true }).name;
+    try {
+      await expect(
+        PluginManager.install(
+          'https://artifacthub.io/packages/headlamp/checksum-repo/checksum-plugin',
+          destDir,
+          '',
+          null
+        )
+      ).rejects.toThrow('Checksum mismatch.');
+    } finally {
+      fs.rmSync(destDir, { recursive: true, force: true });
+    }
+  });
+});
+
+const fetchWithRetry = pluginManagement.fetchWithRetry;
+
+describe('fetchWithRetry', () => {
+  let originalFetch;
+
+  beforeEach(() => {
+    originalFetch = global.fetch;
+    global.fetch = jest.fn();
+    jest.spyOn(global, 'setTimeout').mockImplementation((cb) => cb());
+  });
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+    jest.restoreAllMocks();
+  });
+
+  test('recovers after transient failures and network rejections', async () => {
+    global.fetch
+      .mockResolvedValueOnce({ ok: false, status: 500 }) // 1st try fails (HTTP error)
+      .mockRejectedValueOnce(new Error('Network connection dropped')) // 2nd try fails (Network error)
+      .mockResolvedValueOnce({ ok: true, status: 200 }); // 3rd try succeeds
+
+    const response = await fetchWithRetry('https://example.com/api', {}, 3);
+
+    expect(global.fetch).toHaveBeenCalledTimes(3);
+    expect(response.ok).toBe(true);
+    expect(response.status).toBe(200);
+  });
+
+  test('exhausts retry budget on network rejections and throws last error', async () => {
+    global.fetch.mockRejectedValue(new Error('Persistent network failure'));
+
+    await expect(fetchWithRetry('https://example.com/api', {}, 3)).rejects.toThrow('Persistent network failure');
+    expect(global.fetch).toHaveBeenCalledTimes(4);
+  });
+
+  test('returns immediately on non-transient client errors', async () => {
+    global.fetch.mockResolvedValueOnce({ ok: false, status: 404 }); // 1st try returns 404
+
+    const response = await fetchWithRetry('https://example.com/api', {}, 3);
+
+    expect(global.fetch).toHaveBeenCalledTimes(1); // Should not retry 404
+    expect(response.ok).toBe(false);
+    expect(response.status).toBe(404);
+  });
+
+  test('exhausts retry budget and returns last failed response for transient statuses', async () => {
+    global.fetch.mockResolvedValue({ ok: false, status: 503 });
+
+    const response = await fetchWithRetry('https://example.com/api', {}, 3);
+
+    expect(global.fetch).toHaveBeenCalledTimes(4);
+    expect(response.ok).toBe(false);
+    expect(response.status).toBe(503);
+
+    expect(global.setTimeout).toHaveBeenCalledTimes(3);
+    expect(global.setTimeout).toHaveBeenNthCalledWith(1, expect.any(Function), 1000);
+    expect(global.setTimeout).toHaveBeenNthCalledWith(2, expect.any(Function), 2000);
+    expect(global.setTimeout).toHaveBeenNthCalledWith(3, expect.any(Function), 4000);
+  });
+
+  test('throws AbortError immediately during a request', async () => {
+    const abortError = new Error('The operation was aborted');
+    abortError.name = 'AbortError';
+    global.fetch.mockRejectedValue(abortError);
+
+    await expect(fetchWithRetry('https://example.com/api', {}, 3)).rejects.toThrow('The operation was aborted');
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+  });
+
+  test('throws AbortError immediately during backoff', async () => {
+    global.fetch.mockResolvedValueOnce({ ok: false, status: 500 });
+
+    // For this test, we actually want setTimeout to block so we can abort it.
+    // We'll restore setTimeout specifically for this test.
+    jest.spyOn(global, 'setTimeout').mockImplementation((cb) => {
+      // Don't call cb, let it hang so we can test cancellation.
+      return 123; // fake timeout ID
+    });
+    jest.spyOn(global, 'clearTimeout').mockImplementation(() => {});
+
+    const controller = new AbortController();
+    const fetchPromise = fetchWithRetry('https://example.com/api', { signal: controller.signal }, 3);
+
+    await Promise.resolve(); // flush fetch promise
+
+    // Abort while it's "waiting" in the mocked setTimeout
+    controller.abort();
+
+    await expect(fetchPromise).rejects.toThrow('The operation was aborted');
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+    expect(global.clearTimeout).toHaveBeenCalled();
+  });
+});

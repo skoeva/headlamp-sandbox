@@ -28,7 +28,7 @@ vi.mock('../../lib/k8s/hpa', () => ({
 }));
 
 vi.mock('../common/Link', () => ({
-  default: ({ children }: any) => children,
+  default: ({ children }: any) => <a href="/reference">{children}</a>,
 }));
 
 vi.mock('../common/SimpleTable', () => ({
@@ -86,6 +86,33 @@ describe('HpaDetails', () => {
     expect(byName['MaxReplicas']).toBe(5);
   });
 
+  it('renders a raw target reference as plain text after a group mismatch', () => {
+    render(
+      <TestContext routerMap={{ namespace: 'default', name: 'my-hpa' }}>
+        <HpaDetails />
+      </TestContext>
+    );
+    const mismatchedHpa = {
+      ...hpa,
+      referenceObject: null,
+      spec: {
+        ...hpa.spec,
+        scaleTargetRef: {
+          apiVersion: 'example.com/v1',
+          kind: 'Deployment',
+          name: 'custom-deployment',
+        },
+      },
+    };
+
+    const props = mockDetailsGrid.mock.calls[0][0];
+    const reference = props
+      .extraInfo(mismatchedHpa)
+      .find((field: any) => field.name.includes('Reference'));
+
+    expect(reference.value).toBe('Deployment/custom-deployment');
+  });
+
   it('hides the Last Scale Time row when there is no scale time', () => {
     render(
       <TestContext routerMap={{ namespace: 'default', name: 'my-hpa' }}>
@@ -96,5 +123,32 @@ describe('HpaDetails', () => {
     const props = mockDetailsGrid.mock.calls[0][0];
     const lastScale = props.extraInfo(hpa).find((f: any) => f.name.includes('Last Scale Time'));
     expect(lastScale.hide).toBe(true);
+  });
+
+  it('safely handles resources with undefined status and spec in extraInfo', () => {
+    render(
+      <TestContext routerMap={{ namespace: 'default', name: 'my-hpa' }}>
+        <HpaDetails />
+      </TestContext>
+    );
+
+    const emptyHpa = {
+      metrics: () => [],
+      jsonData: {},
+    } as any;
+
+    const props = mockDetailsGrid.mock.calls[0][0];
+    const extraRows = props.extraInfo(emptyHpa);
+    expect(extraRows).toBeDefined();
+
+    const byName = Object.fromEntries(
+      extraRows.map((f: any) => [String(f.name).split('|').pop(), f])
+    );
+
+    expect(byName['MinReplicas'].value).toBeUndefined();
+    expect(byName['MaxReplicas'].value).toBeUndefined();
+    expect(byName['Deployment pods'].value).toBe('0 current / 0 desired');
+    expect(byName['Last Scale Time'].hide).toBe(true);
+    expect(byName['Reference'].value).toBe('-');
   });
 });

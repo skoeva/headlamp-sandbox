@@ -53,6 +53,13 @@ installOptions:
   maxConcurrent: 3
 ```
 
+Dependencies refer to plugin `name` values in the same configuration. Unknown
+names and dependency cycles are rejected before installation starts. Configuration
+order does not need to match dependency order: prerequisites finish before their
+dependents are attempted in both sequential and parallel mode. A failed or skipped
+prerequisite causes its dependents to be skipped; independent plugins can continue.
+Parallel mode runs up to `maxConcurrent` dependency-ready plugins per batch.
+
 ## Available Classes
 
 The package exports the following classes for programmatic use:
@@ -71,6 +78,41 @@ const manager = new PluginManager();
 // Create a multi-plugin manager for handling multiple plugins
 const multiManager = new MultiPluginManager();
 ```
+
+## Testing and statement coverage
+
+From this directory:
+
+```bash
+npm ci
+npm run test:unit -- --runInBand
+npm run test:cli
+npm run test:coverage
+```
+
+`test:cli` runs isolated real-process tests for extraction, packaging/checksums,
+argument validation, listing, and removal. Fixtures use temporary directories and
+do not require network access, a global npm link, or an installed Headlamp app.
+
+`test:coverage` combines the existing Jest unit suite, those CLI tests, and the
+existing `src/plugin-management.e2e.js` install/update/uninstall workflow. The unit
+suite and that existing workflow **require access to Artifact Hub and its plugin
+archive host**; this is not an offline or deterministic-network test command.
+The update fixture downgrades its recorded version so the update actually runs.
+The older `npm test`/`test-pluginctl.js` global-link workflow is not invoked.
+
+The report covers the package entrypoint (`index.js`), CLI (`bin/**/*.js`), and
+implementation (`src/**/*.js`), excluding test files. All four production files
+remain in the denominator, even if unexecuted. Istanbul coverage from Jest and
+instrumented CLI subprocesses is merged by source location, not by averaging
+percentages. Production code and existing test behavior are not excluded to
+improve the score.
+
+Reports are written to `coverage/index.html`, `coverage/coverage-final.json`, and
+`coverage/coverage-summary.json`. Unit-only counters are retained in
+`coverage/unit/`. The command removes its previous `coverage/` output before
+running and exits unsuccessfully if any suite fails; a partial run is not reported
+as success.
 
 ## Using npm link for Development
 

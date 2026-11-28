@@ -16,11 +16,13 @@
 
 import { Icon } from '@iconify/react';
 import Box from '@mui/material/Box';
+import Button from '@mui/material/Button';
 import Paper from '@mui/material/Paper';
 import { useTheme } from '@mui/material/styles';
 import MuiTable from '@mui/material/Table';
-import { TableCellProps } from '@mui/material/TableCell';
+import TableCell, { TableCellProps } from '@mui/material/TableCell';
 import TableHead from '@mui/material/TableHead';
+import Typography from '@mui/material/Typography';
 import { alpha, styled } from '@mui/system';
 import { visuallyHidden } from '@mui/utils';
 import {
@@ -29,6 +31,7 @@ import {
   MRT_Column,
   MRT_ColumnDef as MaterialTableColumn,
   MRT_Header,
+  MRT_Row,
   MRT_TableBodyCell,
   MRT_TableHeadCell,
   MRT_TableInstance,
@@ -38,6 +41,7 @@ import {
   MRT_ToggleFullScreenButton,
   MRT_ToggleGlobalFilterButton,
   MRT_TopToolbar,
+  MRT_VisibilityState,
   useMaterialReactTable,
   useMRT_Rows,
 } from 'material-react-table';
@@ -100,6 +104,12 @@ export type TableProps<RowItem extends Record<string, any>> = Omit<
   /** Collapse the bottom toolbar when it has no pagination, status, or actions. */
   hideEmptyBottomToolbar?: boolean;
   /**
+   * Optional quick-action controls rendered below {@link emptyMessage} when
+   * the table has no data. Not shown for the "no filter results" case, which
+   * is a user-driven state rather than an empty resource list.
+   */
+  emptyActions?: ReactNode;
+  /**
    * Error message to show instead of the table
    */
   errorMessage?: ReactNode;
@@ -129,6 +139,8 @@ export type TableProps<RowItem extends Record<string, any>> = Omit<
    */
   loading?: boolean;
   renderRowSelectionToolbar?: (props: { table: MRT_TableInstance<RowItem> }) => ReactNode;
+  /** Additional controls beside the standard search and filter buttons. */
+  renderAdditionalToolbarActions?: (props: { table: MRT_TableInstance<RowItem> }) => ReactNode;
 };
 
 // Use a zero-indexed "useURLState" hook, so pages are shown in the URL as 1-indexed
@@ -205,7 +217,10 @@ const truncatedFacetedValues = new WeakSet<Map<any, number>>();
 type FacetedEntry = {
   /** Every value the rows carry, independent of what the column is filtered by. */
   values: Map<any, number>;
-  /** The shortened view of those values, kept per filter it was built for. */
+  /**
+   * What is served instead of those values, shortened or with a selection added. Only the
+   * last one built is kept, along with the filter and variant it was built for.
+   */
   view?: Map<any, number>;
   viewFor?: string;
 };
@@ -213,28 +228,48 @@ type FacetedEntry = {
 const facetedValuesByRows = new WeakMap<object, Map<string, FacetedEntry>>();
 
 /**
- * The options a column offers: all of its values, or the most common ones plus whatever is
- * filtered for once there are more than MRT can render. The walk behind `entry.values` does
- * not depend on the filter, so only this last step is redone when the filter moves, and the
- * shortened map keeps its identity meanwhile, which is what MRT memoizes its dropdown on.
+ * The options a column offers: all of its values, or the most common ones once there are more
+ * than MRT can render, plus whatever a select or multi-select is filtered for in either case,
+ * since those read the label of a selection back from these options. The walk behind
+ * `entry.values` does not depend on the filter, so only this last step is redone when the
+ * filter moves, and the resulting map keeps its identity meanwhile, which is what MRT memoizes
+ * its dropdown on.
  */
-function facetedView(entry: FacetedEntry, column: { getFilterValue: () => unknown }) {
-  if (entry.values.size <= MAX_FILTER_OPTIONS) {
+function facetedView(
+  entry: FacetedEntry,
+  column: { getFilterValue: () => unknown },
+  labelsFromOptions: boolean
+) {
+  // A column MRT cannot sort keeps its empty dropdown, whatever it is filtered by.
+  if (entry.values === NO_FACETED_VALUES) {
     return entry.values;
   }
-  const viewFor = filterSignature(column);
+  // What is filtered for right now comes along whatever its count, because MRT reads the
+  // label of a selected value back from these options and would render it blank once the
+  // value is gone. A refresh can take a selected value out of the rows altogether, it then
+  // stays offered with a count of 0. Only strings, since MRT sorts the options with
+  // localeCompare. The autocomplete keeps its own input instead, and its filter is free
+  // text, which must not turn into an option.
+  const active = selectedOptionValues(column);
+  const absent = labelsFromOptions ? [...active].filter(value => !entry.values.has(value)) : [];
+  if (entry.values.size <= MAX_FILTER_OPTIONS && absent.length === 0) {
+    return entry.values;
+  }
+  // Keyed on exactly what the view is built from, so neither a filter that only differs in
+  // what was dropped above nor a column that changed its variant is served a stale view.
+  const viewFor = JSON.stringify([labelsFromOptions, ...[...active].sort()]);
   if (entry.view && entry.viewFor === viewFor) {
     return entry.view;
   }
   // MRT renders one unvirtualized menu item per option, so keep the most common values,
-  // which are the ones worth offering as a filter. What is filtered for right now comes
-  // along whatever its count, because MRT reads the label of a selected value back from
-  // these options and would render it blank once the value is gone.
+  // which are the ones worth offering as a filter.
   const byCount = [...entry.values].sort(([, a], [, b]) => b - a);
-  const active = new Set(activeFilterValues(column));
   // Selected values come first, but they are capped too: the limit exists to bound what
   // MRT renders, and it cannot be raised by selecting more.
-  const kept = byCount.filter(([value]) => active.has(value)).slice(0, MAX_FILTER_OPTIONS);
+  const kept: [any, number][] = [
+    ...byCount.filter(([value]) => active.has(value)),
+    ...absent.map((value): [string, number] => [value, 0]),
+  ].slice(0, MAX_FILTER_OPTIONS);
   for (const candidate of byCount) {
     if (kept.length >= MAX_FILTER_OPTIONS) {
       break;
@@ -245,7 +280,11 @@ function facetedView(entry: FacetedEntry, column: { getFilterValue: () => unknow
   }
   entry.view = new Map(kept);
   entry.viewFor = viewFor;
-  truncatedFacetedValues.add(entry.view);
+  // Only a map that left values out is a shortened list, one that just added the absent
+  // selection is not.
+  if (entry.values.size + absent.length > kept.length) {
+    truncatedFacetedValues.add(entry.view);
+  }
   return entry.view;
 }
 
@@ -254,9 +293,23 @@ function isTruncated<RowItem extends Record<string, any>>(column: MRT_Column<Row
   return truncatedFacetedValues.has(column.getFacetedUniqueValues());
 }
 
-/** A stable key for the values a column is filtered by, to tell one walk's basis from another. */
-function filterSignature(column: { getFilterValue: () => unknown }) {
-  return JSON.stringify(activeFilterValues(column).map(String).sort());
+/**
+ * Whether MRT reads the label of a selected value back from the faceted values, which the
+ * select and multi-select do unless the column brings its own options. The autocomplete
+ * shows its own input instead.
+ */
+function readsLabelsFromOptions(columnDef: TableColumn<Record<string, any>> | undefined) {
+  return (
+    (columnDef?.filterVariant === 'select' || columnDef?.filterVariant === 'multi-select') &&
+    !columnDef.filterSelectOptions
+  );
+}
+
+/** The filter values a dropdown can offer as options, which MRT requires to be strings. */
+function selectedOptionValues(column: { getFilterValue: () => unknown }) {
+  return new Set(
+    activeFilterValues(column).filter((value): value is string => typeof value === 'string')
+  );
 }
 
 /** The values a column is filtered by right now, one for select, several for multi-select. */
@@ -306,7 +359,7 @@ const getDropdownFacetedUniqueValues: NonNullable<
     const cachedColumns = facetedValuesByRows.get(flatRows);
     const cached = cachedColumns?.get(columnId);
     if (cached) {
-      return facetedView(cached, column);
+      return facetedView(cached, column, readsLabelsFromOptions(columnDef));
     }
     // Nobody can see the options while the filter UI is hidden and no filter is active,
     // so do not walk the rows for them. Showing the UI re-renders the headers and lands
@@ -347,9 +400,23 @@ const getDropdownFacetedUniqueValues: NonNullable<
     const perColumn = cachedColumns ?? new Map();
     perColumn.set(columnId, entry);
     facetedValuesByRows.set(flatRows, perColumn);
-    return facetedView(entry, column);
+    return facetedView(entry, column, readsLabelsFromOptions(columnDef));
   };
 };
+
+/**
+ * Id MRT gives the actions column it renders for `enableRowActions`.
+ */
+const MRT_ROW_ACTIONS_COLUMN_ID = 'mrt-row-actions';
+
+/**
+ * Ids of the action columns, which follow the other columns in and out of view rather
+ * than being toggled on their own: the caller-defined one and MRT's built-in one.
+ */
+const ACTIONS_COLUMN_IDS = ['actions', MRT_ROW_ACTIONS_COLUMN_ID];
+
+/** Shared so that an absent map doesn't look like a new one on every render. */
+const NO_COLUMN_VISIBILITY: MRT_VisibilityState = {};
 
 /**
  * Tracks the current width of an element using a ResizeObserver.
@@ -382,6 +449,7 @@ function useContainerWidth(ref: React.RefObject<HTMLElement | null>) {
  */
 export default function Table<RowItem extends Record<string, any>>({
   emptyMessage,
+  emptyActions,
   reflectInURL,
   initialPage = 1,
   rowsPerPage,
@@ -431,11 +499,26 @@ export default function Table<RowItem extends Record<string, any>>({
   const tableContainerRef = useRef<HTMLDivElement>(null);
   const containerWidth = useContainerWidth(tableContainerRef);
 
-  // Controlled column visibility so responsive hiding, caller-provided visibility
-  // and MRT's own visibility changes all stay in sync.
-  const [columnVisibility, setColumnVisibility] = useState<Record<string, boolean>>(
+  const [initialColumnVisibility] = useState<MRT_VisibilityState>(
     tableProps.initialState?.columnVisibility ?? {}
   );
+
+  // Columns the user toggled while the caller doesn't control the visibility.
+  const [localColumnVisibility, setLocalColumnVisibility] = useState<MRT_VisibilityState>({});
+
+  // With a change callback the caller owns the visibility: its map holds the choices it
+  // accepted or restored, and a change it rejects never gets in. Without one, its map only
+  // holds defaults, which responsive hiding may still override.
+  const isVisibilityControlled = !!tableProps.onColumnVisibilityChange;
+  const explicitColumnVisibility = isVisibilityControlled
+    ? tableProps.state?.columnVisibility ?? NO_COLUMN_VISIBILITY
+    : localColumnVisibility;
+  const [internalActionVisibility, setInternalActionVisibility] = useState<MRT_VisibilityState>({});
+  const lastInternalActionsRef = useRef<boolean | undefined>();
+
+  // The visibility already sent in this event, so a second functional update in the same
+  // event builds on the first one rather than on what was last rendered.
+  const pendingColumnVisibility = useRef<MRT_VisibilityState>();
 
   // Provide defaults for the columns
   const tableColumns: TableColumn<RowItem>[] = useMemo(
@@ -475,18 +558,32 @@ export default function Table<RowItem extends Record<string, any>>({
     return ids;
   }, [tableProps.columns, tableProps.enableRowActions, tableProps.enableRowSelection]);
 
+  // Visibility before responsive hiding and before the user touched anything.
+  const baseColumnVisibility = useMemo<MRT_VisibilityState>(
+    () =>
+      isVisibilityControlled
+        ? tableProps.state?.columnVisibility ?? initialColumnVisibility
+        : { ...tableProps.state?.columnVisibility, ...initialColumnVisibility },
+    [isVisibilityControlled, tableProps.state?.columnVisibility, initialColumnVisibility]
+  );
+
   // Decide which columns to hide based on the available width. Columns are hidden by
   // ascending `responsivePriority` (least important first), then right-to-left among
   // equal priority. The first column is never hidden. When everything fits, nothing
-  // is hidden and the table renders as usual.
+  // is hidden and the table renders as usual. Columns the user turned on, locked
+  // columns, and action columns are never hidden here.
   const responsiveHidden = useMemo(() => {
-    const result: Record<string, boolean> = {};
+    const result: MRT_VisibilityState = {};
     if (!containerWidth) {
       return result;
     }
 
-    const callerVisibility = tableProps.state?.columnVisibility;
-    const dataCols = tableColumns.filter(col => callerVisibility?.[col.id ?? ''] !== false);
+    // Columns that would show without responsive hiding, so a column the user turned
+    // on is measured even when it is hidden by default.
+    const dataCols = tableColumns.filter(col => {
+      const id = col.id ?? '';
+      return explicitColumnVisibility[id] ?? baseColumnVisibility[id] !== false;
+    });
 
     let reserved = 0;
     if (tableProps.enableRowSelection) {
@@ -505,7 +602,13 @@ export default function Table<RowItem extends Record<string, any>>({
     // Columns we're allowed to hide, ordered by what to drop first.
     dataCols
       .map((col, index) => ({ col, index }))
-      .filter(({ index }) => index !== 0)
+      .filter(
+        ({ col, index }) =>
+          index !== 0 &&
+          explicitColumnVisibility[col.id ?? ''] !== true &&
+          col.enableHiding !== false &&
+          !ACTIONS_COLUMN_IDS.includes(col.id ?? '')
+      )
       .sort((a, b) => {
         const priorityDiff = (a.col.responsivePriority ?? 0) - (b.col.responsivePriority ?? 0);
         return priorityDiff !== 0 ? priorityDiff : b.index - a.index;
@@ -522,19 +625,60 @@ export default function Table<RowItem extends Record<string, any>>({
   }, [
     containerWidth,
     tableColumns,
-    tableProps.state?.columnVisibility,
+    baseColumnVisibility,
     tableProps.enableRowSelection,
     tableProps.enableRowActions,
+    explicitColumnVisibility,
   ]);
 
-  const mergedColumnVisibility = useMemo(
-    () => ({
-      ...(tableProps.state?.columnVisibility ?? {}),
-      ...columnVisibility,
+  // An explicit choice outranks the responsive layout, so `explicitColumnVisibility`
+  // is applied last.
+  const mergedColumnVisibility = useMemo<MRT_VisibilityState>(() => {
+    const merged: MRT_VisibilityState = {
+      ...baseColumnVisibility,
       ...responsiveHidden,
-    }),
-    [tableProps.state?.columnVisibility, columnVisibility, responsiveHidden]
-  );
+      ...explicitColumnVisibility,
+      ...(tableProps.enableGrouping ? { 'mrt-row-expand': false } : {}),
+      ...internalActionVisibility,
+    };
+
+    for (const column of tableColumns) {
+      const id = column.id ?? '';
+      const callerVisibility = tableProps.state?.columnVisibility?.[id];
+      if (column.enableHiding === false && callerVisibility !== undefined) {
+        merged[id] = callerVisibility;
+      }
+    }
+
+    const dataColumns = tableColumns.filter(col => !ACTIONS_COLUMN_IDS.includes(col.id ?? ''));
+    if (dataColumns.length === 0) {
+      return merged;
+    }
+
+    const allDataColumnsHidden = dataColumns.every(col => merged[col.id ?? ''] === false);
+    const presentActionIds = ACTIONS_COLUMN_IDS.filter(
+      id =>
+        tableColumns.some(col => (col.id ?? '') === id) ||
+        (id === MRT_ROW_ACTIONS_COLUMN_ID && tableProps.enableRowActions)
+    );
+
+    if (allDataColumnsHidden) {
+      presentActionIds.forEach(id => {
+        merged[id] = false;
+      });
+    }
+
+    return merged;
+  }, [
+    baseColumnVisibility,
+    responsiveHidden,
+    explicitColumnVisibility,
+    tableColumns,
+    tableProps.enableRowActions,
+    tableProps.enableGrouping,
+    tableProps.state?.columnVisibility,
+    internalActionVisibility,
+  ]);
 
   // With faceting on, MRT installs TanStack's own implementation for every column, so ours
   // is only needed to fill the gap it leaves behind when faceting is off.
@@ -600,6 +744,23 @@ export default function Table<RowItem extends Record<string, any>>({
     enablePagination: tableData.length > rowsPerPageOptions[0],
     enableDensityToggle: tableProps.enableDensityToggle ?? false,
     enableFullScreenToggle: tableProps.enableFullScreenToggle ?? false,
+    // MRT adds a drag handle to every header when grouping is enabled, for drag-to-group.
+    // Grouping is driven by the caller's state here, so only show it when asked for.
+    ...(tableProps.enableGrouping && tableProps.enableColumnDragging === undefined
+      ? { enableColumnDragging: false }
+      : {}),
+    // Group headings are rendered without a checkbox, so they can't be selected, and
+    // selecting rows never reaches the rows of a collapsed group or of another page.
+    ...(tableProps.enableGrouping && tableProps.enableRowSelection
+      ? {
+          enableRowSelection: (row: MRT_Row<RowItem>) =>
+            !row.getIsGrouped() &&
+            (typeof tableProps.enableRowSelection === 'function'
+              ? tableProps.enableRowSelection(row)
+              : true),
+          enableSubRowSelection: false,
+        }
+      : {}),
     enableColumnActions: false,
     localization: getTableLocalization(i18n.resolvedLanguage || i18n.language),
     autoResetAll: false,
@@ -617,7 +778,67 @@ export default function Table<RowItem extends Record<string, any>>({
       }
     },
     onGlobalFilterChange: setGlobalFilter,
-    onColumnVisibilityChange: setColumnVisibility,
+    onColumnVisibilityChange: (
+      updater: MRT_VisibilityState | ((old: MRT_VisibilityState) => MRT_VisibilityState)
+    ) => {
+      const isUpdater = typeof updater === 'function';
+      const previous = pendingColumnVisibility.current ?? mergedColumnVisibility;
+      const next = isUpdater ? updater(previous) : updater;
+      const knownIds = new Set([
+        ...tableColumns.map(col => col.id ?? ''),
+        ...Object.keys(previous),
+        ...Object.keys(next),
+      ]);
+      // Replaying a functional updater against inverse visibility distinguishes a column
+      // explicitly assigned false/true by actions such as Hide all from one merely copied
+      // forward at its responsive value.
+      const alternate = isUpdater
+        ? updater(Object.fromEntries([...knownIds].map(id => [id, previous[id] === false])))
+        : undefined;
+
+      // Action columns are derived from the other columns, never a user choice.
+      const changes: MRT_VisibilityState = {};
+      knownIds.forEach(id => {
+        if (ACTIONS_COLUMN_IDS.includes(id)) {
+          return;
+        }
+        const wasVisible = previous[id] !== false;
+        const isVisible = next[id] !== false;
+        const explicitlySet =
+          (!isUpdater && Object.prototype.hasOwnProperty.call(next, id)) ||
+          (alternate !== undefined && isVisible === (alternate[id] !== false));
+        if (wasVisible !== isVisible || explicitlySet) {
+          changes[id] = isVisible;
+        }
+      });
+
+      if (Object.keys(changes).length === 0) {
+        return;
+      }
+
+      if (!pendingColumnVisibility.current) {
+        queueMicrotask(() => {
+          pendingColumnVisibility.current = undefined;
+        });
+      }
+      pendingColumnVisibility.current = { ...previous, ...changes };
+
+      if (!isVisibilityControlled) {
+        setLocalColumnVisibility(prev => ({ ...prev, ...changes }));
+        return;
+      }
+
+      // A complete map replaces the caller's, so carry over how it set the action columns.
+      const isActionColumn = ([id]: [string, boolean]) => ACTIONS_COLUMN_IDS.includes(id);
+      tableProps.onColumnVisibilityChange?.(
+        isUpdater
+          ? (old: MRT_VisibilityState) => ({ ...old, ...changes })
+          : Object.fromEntries([
+              ...Object.entries(baseColumnVisibility).filter(isActionColumn),
+              ...Object.entries(next).filter(entry => !isActionColumn(entry)),
+            ])
+      );
+    },
     renderToolbarInternalActions: ({ table: tbl }) => {
       const isSomeRowsSelected =
         tableProps.enableRowSelection && tbl.getSelectedRowModel().rows.length !== 0;
@@ -646,6 +867,7 @@ export default function Table<RowItem extends Record<string, any>>({
           {enableFilters && enableColumnFilters && columnFilterDisplayMode !== 'popover' && (
             <MRT_ToggleFiltersButton table={tbl} />
           )}
+          {tableProps.renderAdditionalToolbarActions?.({ table: tbl })}
           {(enableHiding || enableColumnOrdering || enableColumnPinning) && (
             <ColumnVisibilityButton table={tbl} />
           )}
@@ -736,10 +958,14 @@ export default function Table<RowItem extends Record<string, any>>({
       size: 'small',
       sx: { padding: 0 },
     },
-    muiSelectAllCheckboxProps: {
+    muiSelectAllCheckboxProps: ({ table: tbl }) => ({
       size: 'small',
       sx: { padding: 0 },
-    },
+      // MRT's page selection state also counts the rows of collapsed groups and the rest
+      // of a group on later pages, which can't be selected here, so the checkbox would never
+      // read as checked or clear the rows it selected. Reflect the rows on screen instead.
+      ...(tableProps.enableGrouping ? getGroupedSelectAllState(tbl) : {}),
+    }),
   });
 
   useShortcut(
@@ -752,21 +978,27 @@ export default function Table<RowItem extends Record<string, any>>({
     [table]
   );
 
-  // Hide actions column when others are hidden
+  // Explicitly visible columns may not fit. Keep their minimum widths inside the
+  // existing table scroll container, leaving toolbar layout and normal tables intact.
+  const needsHorizontalScroll =
+    containerWidth > 0 &&
+    tableColumns.filter(col => mergedColumnVisibility[col.id ?? ''] !== false).length *
+      DEFAULT_MIN_COLUMN_WIDTH +
+      (tableProps.enableRowSelection ? 44 : 0) +
+      (tableProps.enableRowActions ? 52 : 0) >
+      containerWidth;
+
   useEffect(() => {
-    const visibility = table.getState().columnVisibility || {};
-
-    const shouldHideActions = tableColumns
-      .filter(col => (col.id ?? '') !== 'actions')
-      .every(col => visibility[col.id ?? ''] === false);
-
-    if (shouldHideActions && visibility['actions'] !== false) {
-      table.setColumnVisibility(prev => ({ ...prev, actions: false }));
-    } else if (!shouldHideActions && visibility['actions'] === false) {
-      table.setColumnVisibility(prev => ({ ...prev, actions: true }));
+    const actionsHidden = table.getState().columnVisibility?.actions === false;
+    if (lastInternalActionsRef.current === actionsHidden) {
+      return;
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [table.getState().columnVisibility, tableColumns, table]);
+    lastInternalActionsRef.current = actionsHidden;
+    setInternalActionVisibility(actionsHidden ? { actions: false } : {});
+    if (actionsHidden) {
+      table.setColumnVisibility(prev => ({ ...prev, actions: false }));
+    }
+  }, [table]);
 
   const gridTemplateColumns = useMemo(() => {
     let preGridTemplateColumns = tableProps.columns
@@ -776,14 +1008,23 @@ export default function Table<RowItem extends Record<string, any>>({
         return !isHidden;
       })
       .map(it => {
-        if (typeof it.gridTemplate === 'number') {
-          return `${it.gridTemplate}fr`;
+        const track =
+          typeof it.gridTemplate === 'number' ? `${it.gridTemplate}fr` : it.gridTemplate ?? '1fr';
+        // Preserve explicit CSS sizing (such as minmax), while flexible and intrinsic
+        // tracks need a minimum to produce real overflow rather than crushed cells.
+        if (needsHorizontalScroll && /^(\d*\.?\d+fr|auto|min-content|max-content)$/.test(track)) {
+          return `minmax(${DEFAULT_MIN_COLUMN_WIDTH}px, ${track})`;
         }
-        return it.gridTemplate ?? '1fr';
+        return track;
       })
       .join(' ');
-    if (tableProps.enableRowActions) {
-      preGridTemplateColumns = `${preGridTemplateColumns} 0.05fr`;
+    if (
+      tableProps.enableRowActions &&
+      mergedColumnVisibility[MRT_ROW_ACTIONS_COLUMN_ID] !== false
+    ) {
+      preGridTemplateColumns = `${preGridTemplateColumns} ${
+        needsHorizontalScroll ? 'minmax(52px, 0.05fr)' : '0.05fr'
+      }`;
     }
     if (tableProps.enableRowSelection) {
       preGridTemplateColumns = `44px ${preGridTemplateColumns}`;
@@ -795,6 +1036,7 @@ export default function Table<RowItem extends Record<string, any>>({
     mergedColumnVisibility,
     tableProps.enableRowActions,
     tableProps.enableRowSelection,
+    needsHorizontalScroll,
   ]);
 
   const rows = useMRT_Rows(table);
@@ -827,7 +1069,7 @@ export default function Table<RowItem extends Record<string, any>>({
       const newSelected: Record<string, boolean> = {};
       for (let i = start; i <= end; i++) {
         const rowId = rowIds[i];
-        if (rowId) {
+        if (rowId && !(tableProps.enableGrouping && rows[i]?.getIsGrouped())) {
           newSelected[rowId] = true;
         }
       }
@@ -865,7 +1107,7 @@ export default function Table<RowItem extends Record<string, any>>({
   } else if (!tableProps.data?.length) {
     content = (
       <Paper variant="outlined">
-        <Empty>{emptyMsg}</Empty>
+        <Empty actions={emptyActions}>{emptyMsg}</Empty>
       </Paper>
     );
   } else {
@@ -875,6 +1117,7 @@ export default function Table<RowItem extends Record<string, any>>({
       <>
         {(tableProps.enableTopToolbar ?? true) && <MRT_TopToolbar table={table} />}
         <MuiTable
+          tabIndex={needsHorizontalScroll ? 0 : undefined}
           sx={{
             display: 'grid',
             border: '1px solid',
@@ -897,22 +1140,53 @@ export default function Table<RowItem extends Record<string, any>>({
                   sorting={header.column.getIsSorted()}
                   showColumnFilters={table.getState().showColumnFilters}
                   selected={table.getSelectedRowModel().flatRows.length}
+                  pageSelection={
+                    tableProps.enableGrouping
+                      ? rows
+                          .map(
+                            row =>
+                              `${row.id}:${row.getCanSelect() ? 1 : 0}${
+                                row.getIsSelected() ? 1 : 0
+                              }`
+                          )
+                          .join('\n')
+                      : ''
+                  }
                   filterValue={header.column.getFilterValue()}
                 />
               ))}
             </StyledHeadRow>
           </TableHead>
           <StyledBody>
-            {rows.map((row, index) => (
-              <Row
-                key={row.id}
-                rowIndex={index}
-                cells={row.getVisibleCells() as MRT_Cell<Record<string, any>, unknown>[]}
-                table={table as MRT_TableInstance<Record<string, any>>}
-                isSelected={row.getIsSelected()}
-                onRowClick={handleRowClick}
-              />
-            ))}
+            {tableProps.enableGrouping &&
+              getContinuedGroupRows(table, rows).map(row => (
+                <GroupRow
+                  key={`${row.id}-continued`}
+                  row={row as MRT_Row<Record<string, any>>}
+                  table={table as MRT_TableInstance<Record<string, any>>}
+                  isExpanded={row.getIsExpanded()}
+                  continued
+                />
+              ))}
+            {rows.map((row, index) =>
+              tableProps.enableGrouping && row.getIsGrouped() ? (
+                <GroupRow
+                  key={row.id}
+                  row={row as MRT_Row<Record<string, any>>}
+                  table={table as MRT_TableInstance<Record<string, any>>}
+                  isExpanded={row.getIsExpanded()}
+                />
+              ) : (
+                <Row
+                  key={row.id}
+                  rowIndex={index}
+                  cells={row.getVisibleCells() as MRT_Cell<Record<string, any>, unknown>[]}
+                  table={table as MRT_TableInstance<Record<string, any>>}
+                  isSelected={row.getIsSelected()}
+                  onRowClick={handleRowClick}
+                />
+              )
+            )}
           </StyledBody>
         </MuiTable>
         {(!hideEmptyBottomToolbar ||
@@ -951,6 +1225,12 @@ const MemoHeadCell = memo(
     sorting: string | false;
     isFiltered: boolean;
     selected: number;
+    /**
+     * The rows on screen with whether each can be and is selected, when the select all
+     * state depends on them. It changes without the selected count or the row ids, e.g.
+     * when a row becomes selectable.
+     */
+    pageSelection: string;
     showColumnFilters: boolean;
     filterValue: any;
   }) => {
@@ -966,12 +1246,119 @@ const MemoHeadCell = memo(
   },
   (a, b) =>
     a.header.column.id === b.header.column.id &&
+    a.header.column.columnDef.header === b.header.column.columnDef.header &&
     a.sorting === b.sorting &&
     a.isFiltered === b.isFiltered &&
     a.showColumnFilters === b.showColumnFilters &&
-    (a.header.column.id === 'mrt-row-select' ? a.selected === b.selected : true) &&
+    (a.header.column.id === 'mrt-row-select'
+      ? a.selected === b.selected && a.pageSelection === b.pageSelection
+      : true) &&
     a.filterValue === b.filterValue
 );
+
+/**
+ * Select-all state for a grouped table, based on the selectable rows on screen: the rows
+ * of expanded groups on the current page.
+ */
+function getGroupedSelectAllState<RowItem extends Record<string, any>>(
+  table: MRT_TableInstance<RowItem>
+) {
+  const visibleRows = table
+    .getRowModel()
+    .rows.filter(row => !row.getIsGrouped() && row.getCanSelect());
+  const selectedCount = visibleRows.filter(row => row.getIsSelected()).length;
+  const checked = visibleRows.length > 0 && selectedCount === visibleRows.length;
+  return {
+    checked,
+    indeterminate: !checked && selectedCount > 0,
+  };
+}
+
+/**
+ * The group headings above the first row of a page that are on an earlier page, outermost
+ * first, so a group continuing from the previous page still shows what it is.
+ */
+function getContinuedGroupRows<RowItem extends Record<string, any>>(
+  table: MRT_TableInstance<RowItem>,
+  pageRows: MRT_Row<RowItem>[]
+): MRT_Row<RowItem>[] {
+  const firstRow = pageRows[0];
+  if (!firstRow || firstRow.depth === 0) {
+    return [];
+  }
+  const allRows = table.getPrePaginationRowModel().rows;
+  const start = allRows.findIndex(row => row.id === firstRow.id);
+  const headings: MRT_Row<RowItem>[] = [];
+  let depth = firstRow.depth;
+  for (let index = start - 1; index >= 0 && depth > 0; index--) {
+    const row = allRows[index];
+    if (row.getIsGrouped() && row.depth < depth) {
+      headings.unshift(row);
+      depth = row.depth;
+    }
+  }
+  return headings;
+}
+
+/**
+ * A full-width row heading a group of rows, with a button to collapse or expand it.
+ * The label comes from the grouping column's `GroupedCell`, falling back to its value.
+ */
+function GroupRow<RowItem extends Record<string, any>>({
+  row,
+  table,
+  isExpanded,
+  continued = false,
+}: {
+  row: MRT_Row<RowItem>;
+  table: MRT_TableInstance<RowItem>;
+  isExpanded: boolean;
+  /** Whether the group started on an earlier page. */
+  continued?: boolean;
+}) {
+  const { t } = useTranslation();
+  const column = row.groupingColumnId ? table.getColumn(row.groupingColumnId) : undefined;
+  const cell = row.getAllCells().find(it => it.column.id === row.groupingColumnId);
+  const GroupedCell = column?.columnDef.GroupedCell;
+  const label =
+    GroupedCell && column
+      ? GroupedCell({ cell: cell as MRT_Cell<RowItem, unknown>, column, row, table })
+      : String(row.groupingValue ?? '');
+  const count = row.getLeafRows().filter(it => !it.getIsGrouped()).length;
+
+  return (
+    <StyledRow data-grouped="true">
+      <TableCell
+        colSpan={table.getVisibleLeafColumns().length}
+        sx={theme => ({
+          gridColumn: '1 / -1',
+          py: 0.5,
+          borderColor: theme.palette.divider,
+          background: theme.palette.background.muted,
+        })}
+      >
+        <Button
+          color="inherit"
+          size="small"
+          aria-expanded={isExpanded}
+          onClick={row.getToggleExpandedHandler()}
+          startIcon={<Icon icon={isExpanded ? 'mdi:chevron-down' : 'mdi:chevron-right'} />}
+          sx={{ textTransform: 'none', fontWeight: 'bold' }}
+        >
+          {label}
+          <Typography component="span" variant="body2" color="text.secondary" sx={{ ml: 1 }}>
+            ({count})
+          </Typography>
+          {continued && (
+            <Typography component="span" variant="body2" color="text.secondary" sx={{ ml: 1 }}>
+              {t('continued')}
+            </Typography>
+          )}
+        </Button>
+      </TableCell>
+    </StyledRow>
+  );
+}
 
 const Row = memo(
   <RowItem extends Record<string, any>>({
@@ -1033,6 +1420,7 @@ const MemoCell = memo(
   },
   (a, b) =>
     a.cell.getValue() === b.cell.getValue() &&
+    a.cell.row.original === b.cell.row.original &&
     (a.cell.column.id === 'mrt-row-select' && b.cell.column.id === 'mrt-row-select'
       ? a.canSelect === b.canSelect && a.isRowSelected === b.isRowSelected
       : true)

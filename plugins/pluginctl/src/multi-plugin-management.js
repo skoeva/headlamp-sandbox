@@ -225,8 +225,9 @@ class MultiPluginManager {
         await Promise.all(chunkPromises);
       }
     } else {
-      // Sequential installation
-      for (const [index, pluginName] of pluginsNames.entries()) {
+      // Use the same dependency-ready ordering with one install at a time.
+      const orderedPlugins = this._createOptimalChunks(graph, 1).flat();
+      for (const [index, pluginName] of orderedPlugins.entries()) {
         if (this.signal?.aborted) {
           throw new Error('Installation cancelled');
         }
@@ -309,6 +310,14 @@ class MultiPluginManager {
       graph.set(plugin.name, plugin.dependencies || []);
     }
 
+    for (const [name, dependencies] of graph) {
+      for (const dependency of dependencies) {
+        if (!graph.has(dependency)) {
+          throw new Error(`Unknown dependency "${dependency}" for plugin "${name}"`);
+        }
+      }
+    }
+
     return graph;
   }
 
@@ -381,19 +390,33 @@ class MultiPluginManager {
    * @param {function} [progressCallback] - Progress callback for this specific plugin
    * @returns {Promise<void>}
    */
-  async installPlugin(plugin, progressCallback) {
+  async installPlugin(plugin, progressCallback = () => {}) {
     progressCallback({ message: `Installing plugin ${plugin.name}` });
+
+    // The single-plugin installer reports errors through its callback instead
+    // of rejecting. Preserve those errors so bulk totals do not count failures
+    // as successes, even when the caller ignores progress events.
+    let installationError;
+    const installationProgress = progress => {
+      if (progress.type === 'error') {
+        installationError ||= new Error(progress.message);
+        progressCallback({ ...progress, raise: false });
+      } else {
+        progressCallback(progress);
+      }
+    };
 
     const params = [
       plugin.source,
       this.pluginsDir || undefined,
       this.headlampVersion || undefined,
-      progressCallback,
+      installationProgress,
       this.signal,
       plugin.version || undefined,
     ];
 
     await PluginManager.install(...params);
+    if (installationError) throw installationError;
   }
 
   /**
@@ -407,24 +430,17 @@ class MultiPluginManager {
 
     while (remaining.size > 0) {
       const chunk = [];
-      const chunkDeps = new Set(); // Track all deps of plugins in current chunk
-
-      // Try to add plugins to current chunk
+      // Only dependencies in earlier chunks have finished. Keep current-chunk
+      // plugins in remaining until the whole chunk is selected.
       for (const plugin of remaining) {
         const deps = graph.get(plugin) || [];
-
-        // Plugin can be added if:
-        // 1. Chunk size < maxConcurrent
-        // 2. None of its deps are in current chunk
-        // 3. None of its deps are in remaining plugins to be processed
-        if (
-          chunk.length < maxConcurrent &&
-          !deps.some(dep => chunk.includes(dep) || chunkDeps.has(dep))
-        ) {
+        if (chunk.length < maxConcurrent && deps.every(dep => !remaining.has(dep))) {
           chunk.push(plugin);
-          // Add this plugin's deps to track for next plugins in chunk
-          deps.forEach(dep => chunkDeps.add(dep));
         }
+      }
+
+      if (chunk.length === 0) {
+        throw new Error('Cannot schedule plugins: unresolved dependencies');
       }
 
       // Remove processed plugins from remaining

@@ -56,7 +56,7 @@ export interface SimpleTableDatumColumn extends SimpleTableColumn {
 }
 
 export interface SimpleTableGetterColumn extends SimpleTableColumn {
-  getter: (...args: any[]) => void;
+  getter: (...args: any[]) => React.ReactNode;
 }
 
 export interface SimpleTableProps {
@@ -259,8 +259,21 @@ export default function SimpleTable(props: SimpleTableProps) {
       if (!getterFunc && !!datum) {
         getterFunc = (item: any) => item[datum];
       }
-      const value1 = getterFunc(item1);
-      const value2 = getterFunc(item2);
+      const value1 = getterFunc(item1) as any;
+      const value2 = getterFunc(item2) as any;
+
+      const isNullish1 = value1 === null || value1 === undefined;
+      const isNullish2 = value2 === null || value2 === undefined;
+
+      if (isNullish1 && isNullish2) {
+        return 0;
+      }
+      if (isNullish1) {
+        return 1;
+      }
+      if (isNullish2) {
+        return -1;
+      }
 
       let compareValue = 0;
       if (value1 < value2) {
@@ -365,6 +378,7 @@ export default function SimpleTable(props: SimpleTableProps) {
           className={className}
           sx={{
             overflowY: 'hidden',
+            backgroundColor: 'background.default',
             ...sx,
           }}
           component={Paper}
@@ -381,6 +395,7 @@ export default function SimpleTable(props: SimpleTableProps) {
                   startIcon={<Icon icon="mdi:refresh" />}
                   onClick={() => {
                     setCurrentData(data);
+                    setDisplayData(data);
                     setPage(0);
                   }}
                 >

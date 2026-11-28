@@ -43,14 +43,47 @@ export interface ClusterSettings {
     accentColor?: string;
     icon?: string;
   };
+  /**
+   * Headlamp tags used to filter and group clusters on the Home page.
+   * Keys and values follow key/value syntax (e.g. "environment": "production").
+   */
+  tags?: Record<string, string>;
 }
 
 export const DEFAULT_NODE_SHELL_LINUX_IMAGE = 'docker.io/library/busybox:latest';
 export const DEFAULT_NODE_SHELL_NAMESPACE = 'default';
 export const DEFAULT_POD_DEBUG_IMAGE = 'docker.io/library/busybox:latest';
 
+const clusterSettingsListeners = new Set<() => void>();
+
+function notifyClusterSettingsListeners() {
+  for (const listener of clusterSettingsListeners) {
+    listener();
+  }
+}
+
+/** Subscribes to settings and namespace-cache changes in this window and other tabs. */
+export function subscribeToClusterSettings(listener: () => void): () => void {
+  clusterSettingsListeners.add(listener);
+  const onStorage = (event: StorageEvent) => {
+    if (
+      event.storageArea === localStorage &&
+      (event.key === null ||
+        event.key.startsWith('cluster_settings.') ||
+        event.key.startsWith('cluster_allowed_namespaces_selector_cache.'))
+    ) {
+      listener();
+    }
+  };
+  window.addEventListener('storage', onStorage);
+  return () => {
+    clusterSettingsListeners.delete(listener);
+    window.removeEventListener('storage', onStorage);
+  };
+}
+
 /**
- * Stores the cluster settings in local storage.
+ * Stores the cluster settings in local storage and notifies subscribers.
  *
  * @param clusterName - The name of the cluster.
  * @param settings - The cluster settings to be stored.
@@ -61,6 +94,7 @@ export function storeClusterSettings(clusterName: string, settings: ClusterSetti
     return;
   }
   localStorage.setItem(`cluster_settings.${clusterName}`, JSON.stringify(settings));
+  notifyClusterSettingsListeners();
 }
 
 /**
@@ -96,7 +130,11 @@ export function loadClusterSettings(clusterName: string): ClusterSettings {
 export interface ResolvedAllowedNamespacesCache {
   /** The label selector this list was resolved from. */
   selector: string;
-  /** The resolved namespace names. */
+  /**
+   * The resolved namespace names. An empty list is a known empty result or a
+   * fail-closed query failure; a missing cache is unresolved and may be reconciled.
+   * Replacing an empty list requires query data newer than resolvedAt.
+   */
   namespaces: string[];
   /** Epoch milliseconds of when the list was last resolved. */
   resolvedAt: number;
@@ -147,7 +185,7 @@ export function loadResolvedAllowedNamespaces(
 
 /**
  * Stores the namespaces resolved from a cluster's label selector, stamped with
- * the selector they were resolved for and the current time.
+ * the selector they were resolved for and the current time, and notifies subscribers.
  *
  * @param clusterName - The name of the cluster.
  * @param selector - The label selector the namespaces were resolved from.
@@ -167,10 +205,11 @@ export function storeResolvedAllowedNamespaces(
     resolvedAt: Date.now(),
   };
   localStorage.setItem(resolvedAllowedNamespacesKey(clusterName), JSON.stringify(entry));
+  notifyClusterSettingsListeners();
 }
 
 /**
- * Removes any cached namespaces resolved from a cluster's label selector.
+ * Removes cached namespaces resolved from a cluster's selector and notifies subscribers.
  *
  * @param clusterName - The name of the cluster.
  */
@@ -179,6 +218,7 @@ export function clearResolvedAllowedNamespaces(clusterName: string) {
     return;
   }
   localStorage.removeItem(resolvedAllowedNamespacesKey(clusterName));
+  notifyClusterSettingsListeners();
 }
 
 /**
@@ -206,6 +246,125 @@ export function isResolvedAllowedNamespacesStale(
 }
 
 /**
+ * Namespaces the backend reported as accessible for users who cannot list
+ * namespaces (see lib/k8s/accessibleNamespaces.ts). Kept in memory only: it is
+ * derived from the current user's permissions and must not outlive the session.
+ * A missing entry means no discovered restriction applies.
+ */
+const discoveredNamespaces = new Map<string, string[]>();
+
+/**
+ * Bumped whenever the identity may have changed (login, logout, token change).
+ * It is part of the discovery query key, so a response for an older identity
+ * can never be written back after a reset.
+ */
+let discoveryGeneration = 0;
+
+/** Bumped on every change, for useSyncExternalStore subscribers. */
+let discoveredNamespacesVersion = 0;
+
+const discoveredNamespacesListeners = new Set<() => void>();
+
+function notifyDiscoveredNamespacesChanged() {
+  discoveredNamespacesVersion++;
+  discoveredNamespacesListeners.forEach(listener => listener());
+}
+
+/**
+ * Subscribes to changes of the discovered namespaces (useSyncExternalStore).
+ *
+ * @param listener - Called after every change.
+ * @returns A function that removes the listener.
+ */
+export function subscribeDiscoveredNamespaces(listener: () => void): () => void {
+  discoveredNamespacesListeners.add(listener);
+  return () => discoveredNamespacesListeners.delete(listener);
+}
+
+/**
+ * Returns a number that changes whenever the discovered namespaces change.
+ */
+export function getDiscoveredNamespacesVersion(): number {
+  return discoveredNamespacesVersion;
+}
+
+/**
+ * Returns the current discovery generation (see resetDiscoveredNamespaces).
+ */
+export function getDiscoveryGeneration(): number {
+  return discoveryGeneration;
+}
+
+function sameNamespaceList(a: string[] | undefined, b: string[] | undefined): boolean {
+  if (a === undefined || b === undefined) {
+    return a === b;
+  }
+  return a.length === b.length && a.every((value, index) => value === b[index]);
+}
+
+/**
+ * Stores or clears the namespaces discovered for a cluster.
+ *
+ * @param clusterName - The name of the cluster.
+ * @param namespaces - The accessible namespaces, or null to drop the restriction.
+ */
+export function setDiscoveredNamespaces(clusterName: string, namespaces: string[] | null) {
+  if (!clusterName) {
+    return;
+  }
+  const next = namespaces === null ? undefined : [...new Set(namespaces)].sort();
+  if (sameNamespaceList(discoveredNamespaces.get(clusterName), next)) {
+    return;
+  }
+  if (next === undefined) {
+    discoveredNamespaces.delete(clusterName);
+  } else {
+    discoveredNamespaces.set(clusterName, next);
+  }
+  notifyDiscoveredNamespacesChanged();
+}
+
+/**
+ * Drops discovered namespaces after the identity may have changed and starts a
+ * new discovery generation, so in-flight results for the old identity are ignored.
+ *
+ * @param clusterName - The cluster to reset, or undefined for all clusters (e.g.
+ *                      after an OIDC login whose token may be broadcast to siblings).
+ */
+export function resetDiscoveredNamespaces(clusterName?: string) {
+  if (clusterName) {
+    discoveredNamespaces.delete(clusterName);
+  } else {
+    discoveredNamespaces.clear();
+  }
+  discoveryGeneration++;
+  notifyDiscoveredNamespacesChanged();
+}
+
+/**
+ * Returns the namespaces discovered for a cluster, or undefined when discovery
+ * does not restrict this cluster.
+ *
+ * @param clusterName - The name of the cluster.
+ */
+export function getDiscoveredNamespaces(clusterName: string): string[] | undefined {
+  return discoveredNamespaces.get(clusterName);
+}
+
+/**
+ * Whether the cluster settings configure namespaces explicitly (manual list or
+ * label selector). Such settings take precedence over discovered namespaces.
+ *
+ * @param settings - The cluster settings.
+ */
+function hasConfiguredAllowedNamespaces(settings: ClusterSettings): boolean {
+  return (
+    (settings.allowedNamespaces?.length ?? 0) > 0 ||
+    Boolean(settings.allowedNamespacesSelector?.trim())
+  );
+}
+
+/**
  * Returns the combined list of allowed namespaces for a cluster: the manually
  * configured ones plus the ones resolved from the namespace label selector (if
  * any). The result is sorted and does not contain duplicates.
@@ -214,11 +373,17 @@ export function isResolvedAllowedNamespacesStale(
  * configured selector, so a stale list left over from a previous selector is
  * never used.
  *
+ * When nothing is configured, the namespaces discovered for users who cannot
+ * list namespaces are returned instead.
+ *
  * @param cluster - The name of the cluster.
  * @returns The combined list of allowed namespaces.
  */
 export function getCombinedAllowedNamespaces(cluster: string): string[] {
   const settings = loadClusterSettings(cluster);
+  if (!hasConfiguredAllowedNamespaces(settings)) {
+    return getDiscoveredNamespaces(cluster) ?? [];
+  }
   const selector = settings.allowedNamespacesSelector?.trim() || '';
   const cache = selector ? loadResolvedAllowedNamespaces(cluster) : null;
   const resolved = cache && cache.selector === selector ? cache.namespaces : [];
@@ -226,15 +391,29 @@ export function getCombinedAllowedNamespaces(cluster: string): string[] {
 }
 
 /**
- * Checks whether a cluster has an explicit or selector-based namespace restriction.
+ * Whether the only namespace restriction of a cluster comes from namespace
+ * discovery (nothing configured in the settings). Discovery only checks a few
+ * resource kinds, so callers may lift it for kinds the user can list cluster-wide.
+ *
+ * @param cluster - The name of the cluster.
+ */
+export function isRestrictedOnlyByDiscovery(cluster: string): boolean {
+  return (
+    !hasConfiguredAllowedNamespaces(loadClusterSettings(cluster)) &&
+    getDiscoveredNamespaces(cluster) !== undefined
+  );
+}
+
+/**
+ * Checks whether a cluster has an explicit, selector-based or discovered namespace restriction.
  *
  * @param cluster - Cluster whose settings should be checked.
- * @returns Whether namespace access is restricted, including when a selector resolves empty.
+ * @returns Whether namespace access is restricted, including when a selector or
+ *          discovery resolves empty.
  */
 export function hasAllowedNamespacesRestriction(cluster: string): boolean {
-  const settings = loadClusterSettings(cluster);
   return (
-    (settings.allowedNamespaces?.length ?? 0) > 0 ||
-    Boolean(settings.allowedNamespacesSelector?.trim())
+    hasConfiguredAllowedNamespaces(loadClusterSettings(cluster)) ||
+    getDiscoveredNamespaces(cluster) !== undefined
   );
 }

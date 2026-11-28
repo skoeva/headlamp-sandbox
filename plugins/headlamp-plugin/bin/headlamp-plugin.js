@@ -65,6 +65,126 @@ function viaCmd(file, args) {
     : [file, args];
 }
 
+const AGENT_HARNESS_FOLDER = path.resolve(__dirname, '..', 'template-agents');
+
+/**
+ * Folders the agent harness skills are copied into, since coding agents read
+ * project skills from different places: .claude/skills for Claude Code,
+ * .agents/skills for Codex (GitHub Copilot reads both). Only the name and
+ * description frontmatter is portable, so the .agents/skills copy drops the
+ * Claude-specific keys (allowed-tools, argument-hint).
+ */
+const AGENT_SKILLS_DIRS = [
+  { skillsDir: path.join('.claude', 'skills'), portableOnly: false },
+  { skillsDir: path.join('.agents', 'skills'), portableOnly: true },
+];
+
+/**
+ * Keeps only the portable name and description keys in a SKILL.md frontmatter.
+ *
+ * @param {string} skillMd - SKILL.md contents.
+ * @returns {string} SKILL.md with a portable frontmatter.
+ */
+function portableSkillFrontmatter(skillMd) {
+  return skillMd.replace(/^---\n([\s\S]*?)\n---\n/, (_, frontmatter) => {
+    const kept = frontmatter.split('\n').filter(line => /^(name|description):/.test(line));
+    return `---\n${kept.join('\n')}\n---\n`;
+  });
+}
+
+/**
+ * A plugin has the agent harness if its AGENTS.md is the harness one, or if any
+ * harness skill is installed. Users may delete skills they no longer need, so
+ * this does not depend on one particular skill.
+ *
+ * @param {string} folder - plugin folder.
+ * @returns {boolean} true if the agent harness is installed.
+ */
+function hasAgentHarness(folder) {
+  const agentsMdPath = path.join(folder, 'AGENTS.md');
+  const harnessHeading = fs
+    .readFileSync(path.join(AGENT_HARNESS_FOLDER, 'AGENTS.md'), 'utf8')
+    .split('\n')[0];
+  if (
+    fs.existsSync(agentsMdPath) &&
+    fs.readFileSync(agentsMdPath, 'utf8').startsWith(harnessHeading)
+  ) {
+    return true;
+  }
+  const skills = fs.readdirSync(path.join(AGENT_HARNESS_FOLDER, 'skills'));
+  return AGENT_SKILLS_DIRS.some(({ skillsDir }) =>
+    skills.some(skill => fs.existsSync(path.join(folder, skillsDir, skill, 'SKILL.md')))
+  );
+}
+
+/**
+ * Adds the opt-in coding agent harness to a plugin folder.
+ *
+ * Writes the shared AGENTS.md, copies the shared skills into each agent's
+ * skills folder (AGENT_SKILLS_DIRS), and copies the per-agent config from
+ * "template-agents/config" (CLAUDE.md, .mcp.json and .codex/config.toml). The
+ * plugin is committed and shared, so it is set up for every supported agent
+ * rather than one.
+ *
+ * AGENTS.md is replaced with the harness version. Existing skills and agent
+ * config are left untouched, so it is safe to run against an
+ * already-scaffolded plugin.
+ *
+ * @param {string} dstFolder - plugin folder to add the harness to.
+ */
+function addAgentHarness(dstFolder) {
+  console.log('Adding coding agent skills (AGENTS.md, skills and agent config)');
+
+  // The harness AGENTS.md replaces the default one. Like the default one, it is
+  // kept in sync with the template by upgrade (see hasAgentHarness).
+  fs.copySync(path.join(AGENT_HARNESS_FOLDER, 'AGENTS.md'), path.join(dstFolder, 'AGENTS.md'));
+
+  const skillsFolder = path.join(AGENT_HARNESS_FOLDER, 'skills');
+  for (const { skillsDir, portableOnly } of AGENT_SKILLS_DIRS) {
+    for (const skill of fs.readdirSync(skillsFolder)) {
+      const dstSkillFolder = path.join(dstFolder, skillsDir, skill);
+      if (fs.existsSync(dstSkillFolder)) {
+        continue;
+      }
+      fs.copySync(path.join(skillsFolder, skill), dstSkillFolder);
+      if (portableOnly) {
+        const skillMdPath = path.join(dstSkillFolder, 'SKILL.md');
+        fs.writeFileSync(
+          skillMdPath,
+          portableSkillFrontmatter(fs.readFileSync(skillMdPath, 'utf8'))
+        );
+      }
+    }
+  }
+  // Existing agent config is kept, so say which files were kept and what they need.
+  // Files identical to the template (e.g. from an earlier run) need nothing.
+  const configFolder = path.join(AGENT_HARNESS_FOLDER, 'config');
+  const keptFiles = fs
+    .readdirSync(configFolder, { recursive: true })
+    .filter(file => fs.statSync(path.join(configFolder, file)).isFile())
+    .filter(file => fs.existsSync(path.join(dstFolder, file)))
+    .filter(
+      file =>
+        fs.readFileSync(path.join(dstFolder, file), 'utf8') !==
+        fs.readFileSync(path.join(configFolder, file), 'utf8')
+    );
+  fs.copySync(configFolder, dstFolder, { overwrite: false, errorOnExist: false });
+  for (const file of keptFiles) {
+    if (file === 'CLAUDE.md') {
+      if (!fs.readFileSync(path.join(dstFolder, file), 'utf8').includes('@AGENTS.md')) {
+        console.log(
+          'Kept existing CLAUDE.md: add a line "@AGENTS.md" so Claude Code reads AGENTS.md.'
+        );
+      }
+    } else {
+      console.log(
+        `Kept existing ${file}: make sure it has the kubernetes, helm and chrome-devtools MCP ` +
+          `servers the skills use (see ${path.join(configFolder, file)}).`
+      );
+    }
+  }
+}
+
 /**
  * Creates a new plugin folder.
  *
@@ -74,9 +194,11 @@ function viaCmd(file, args) {
  * @param {string} name - name of package and output folder.
  * @param {boolean} link - if we link @kinvolk/headlamp-plugin for testing
  * @param {boolean} noInstall - if we skip installing with "npm ci"
+ * @param {boolean} withAgentSkills - if we also scaffold the coding agent harness
+ *   (AGENTS.md, skills and agent config) from the "template-agents" folder.
  * @returns {0 | 1 | 2 | 3} Exit code, where 0 is success, 1, 2, and 3 are failures.
  */
-function create(name, link, noInstall) {
+function create(name, link, noInstall, withAgentSkills) {
   const dstFolder = name;
   const templateFolder = path.resolve(__dirname, '..', 'template');
   const indexPath = path.join(dstFolder, 'src', 'index.tsx');
@@ -121,6 +243,13 @@ function create(name, link, noInstall) {
   replaceFileVariables(packageLockPath);
   replaceFileVariables(indexPath);
   replaceFileVariables(readmePath);
+
+  // Opt-in coding agent harness. Copied from a separate "template-agents"
+  // folder so the default scaffold stays untouched unless --with-agent-skills
+  // is passed.
+  if (withAgentSkills) {
+    addAgentHarness(dstFolder);
+  }
 
   // This can be used to make testing locally easier.
   if (link) {
@@ -947,33 +1076,37 @@ async function build(packageFolder) {
 
     process.chdir(folder);
 
-    // Read package.json to get plugin name
-    const packageJson = JSON.parse(fs.readFileSync('package.json', 'utf8'));
-    const pluginName = packageJson.name || path.basename(folder);
-
-    console.log(`Building "${folder}" for production with plugin name: ${pluginName}...`);
-
-    const config = await viteConfigPromise;
-    const vite = await vitePromise;
-
-    // Clone the config and add plugin name injection
-    const buildConfig = { ...config.default };
-
-    // Add plugin name injection to the plugins array
-    if (!buildConfig.plugins) {
-      buildConfig.plugins = [];
-    }
-
-    if (typeof process.env.NODE_ENV === 'undefined') {
-      process.env.NODE_ENV = 'production';
-    }
-    injectEnvVars(buildConfig);
-
-    // Import the plugin name injection plugin
-    const { pluginNameInjection } = await import('../config/vite-plugin-name-injection.mjs');
-    buildConfig.plugins.push(pluginNameInjection({ pluginName }));
-
     try {
+      // Read package.json to get plugin name
+      const packageJson = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+      const pluginName = packageJson.name || path.basename(folder);
+
+      console.log(`Building "${folder}" for production with plugin name: ${pluginName}...`);
+
+      const config = await viteConfigPromise;
+      const vite = await vitePromise;
+
+      // Clone the config and add plugin name injection
+      const buildConfig = {
+        ...config.default,
+        root: process.cwd(),
+        define: { ...config.default.define },
+        plugins: [...(config.default.plugins || [])],
+        build: {
+          ...config.default.build,
+          lib: { ...config.default.build.lib, entry: path.resolve('src/index.tsx') },
+        },
+      };
+
+      if (typeof process.env.NODE_ENV === 'undefined') {
+        process.env.NODE_ENV = 'production';
+      }
+      injectEnvVars(buildConfig);
+
+      // Import the plugin name injection plugin
+      const { pluginNameInjection } = await import('../config/vite-plugin-name-injection.mjs');
+      buildConfig.plugins.push(pluginNameInjection({ pluginName }));
+
       await vite.build(buildConfig);
 
       // Copy extra dist files after successful build
@@ -984,17 +1117,18 @@ async function build(packageFolder) {
       await brotliCompressDist(distDir);
 
       console.log(`Finished building "${folder}" for production.`);
+
+      return true;
     } catch (e) {
       console.error(e);
       console.error(`Failed to build "${folder}" for production.`);
-      process.exit(1);
+      return false;
+    } finally {
+      process.chdir(oldCwd);
     }
-
-    process.chdir(oldCwd);
-    return true;
   }
 
-  function buildFolderOfPackages() {
+  async function buildFolderOfPackages() {
     const folders = fs.readdirSync(packageFolder, { withFileTypes: true }).filter(fileName => {
       return (
         fileName.isDirectory() &&
@@ -1002,17 +1136,19 @@ async function build(packageFolder) {
       );
     });
 
-    folders.forEach(folder => {
+    for (const folder of folders) {
       const folderToBuild = path.join(packageFolder, folder.name);
-      if (!buildPackage(folderToBuild)) {
-        console.error(`"${folderToBuild}" does not contain a package. Not building.`);
-      }
-    });
+      if (!(await buildPackage(folderToBuild))) return false;
+    }
     return folders.length !== 0;
   }
 
-  if (!(buildPackage(packageFolder) || buildFolderOfPackages())) {
-    console.error(`"${packageFolder}" does not contain a package or packages. Not building.`);
+  const built = fs.existsSync(path.join(packageFolder, 'package.json'))
+    ? await buildPackage(packageFolder)
+    : await buildFolderOfPackages();
+  if (!built) {
+    console.error(`Failed to build package or packages in "${packageFolder}".`);
+    return 1;
   }
 
   return 0;
@@ -1079,9 +1215,12 @@ function getNpmOutdated() {
  * @param packageFolder {string} - folder where the package, or folder of packages is.
  * @parm skipPackageUpdates {boolean} - do not upgrade packages if true.
  * @param headlampPluginVersion {string} - tag or version of headlamp-plugin to upgrade to.
+ * @param withAgentSkills {boolean} - if true, add the coding agent harness to the
+ *   package(s) being upgraded. AGENTS.md is replaced with the harness version;
+ *   existing skills and agent config are left untouched.
  * @returns {0 | 1} Exit code, where 0 is success, 1 is failure.
  */
-function upgrade(packageFolder, skipPackageUpdates, headlampPluginVersion) {
+function upgrade(packageFolder, skipPackageUpdates, headlampPluginVersion, withAgentSkills) {
   /**
    * Files from the template might not be there.
    *
@@ -1101,8 +1240,14 @@ function upgrade(packageFolder, skipPackageUpdates, headlampPluginVersion) {
     ];
     const templateFolder = path.resolve(__dirname, '..', 'template');
 
+    // Plugins with the agent harness use its AGENTS.md instead of the default one.
+    const agentsMdTemplateFolder = hasAgentHarness('.') ? AGENT_HARNESS_FOLDER : templateFolder;
+
     missingFiles.forEach(pathToCheck => {
-      const from = path.join(templateFolder, pathToCheck);
+      const from = path.join(
+        pathToCheck === 'AGENTS.md' ? agentsMdTemplateFolder : templateFolder,
+        pathToCheck
+      );
       const to = path.join('.', pathToCheck);
 
       // only copy it if it doesn't exist
@@ -1329,6 +1474,12 @@ function upgrade(packageFolder, skipPackageUpdates, headlampPluginVersion) {
 
     process.chdir(folder);
     console.log(`Upgrading "${folder}"...`);
+
+    // Opt-in: add the coding agent harness. Run before addMissingTemplateFiles
+    // so a missing AGENTS.md gets the harness version, not the default one.
+    if (withAgentSkills) {
+      addAgentHarness('.');
+    }
 
     addMissingTemplateFiles();
     addMissingConfiguration();
@@ -1882,11 +2033,17 @@ yargs(process.argv.slice(2))
         .option('noinstall', {
           describe: 'Skip installing dependencies with npm ci',
           type: 'boolean',
+        })
+        .option('with-agent-skills', {
+          describe:
+            'Also scaffold the coding agent harness: AGENTS.md, skills and MCP config ' +
+            'for Claude Code, Codex and GitHub Copilot.',
+          type: 'boolean',
         });
     },
     argv => {
       // @ts-ignore
-      process.exitCode = create(argv.name, argv.link, argv.noinstall);
+      process.exitCode = create(argv.name, argv.link, argv.noinstall, argv['with-agent-skills']);
     }
   )
   .command(
@@ -2104,11 +2261,23 @@ yargs(process.argv.slice(2))
           describe:
             'Use a specific headlamp-plugin-version when upgrading packages. Defaults to "latest".',
           type: 'string',
+        })
+        .option('with-agent-skills', {
+          describe:
+            'Add the coding agent harness (AGENTS.md, skills and MCP config for Claude Code, ' +
+            'Codex and GitHub Copilot) to the upgraded plugin(s). AGENTS.md is replaced with the ' +
+            'harness version; existing skills and agent config are left untouched.',
+          type: 'boolean',
         });
     },
     argv => {
       // @ts-ignore
-      process.exitCode = upgrade(argv.package, argv.skipPackageUpdates, argv.headlampPluginVersion);
+      process.exitCode = upgrade(
+        argv.package,
+        argv.skipPackageUpdates,
+        argv.headlampPluginVersion,
+        argv['with-agent-skills']
+      );
     }
   )
   .command(

@@ -98,7 +98,8 @@ declare global {
  * "url" field instead).
  */
 export interface AppMenu {
-  /** A URL to open (if not starting with http, then it'll be opened in the external browser) */
+  /** A URL to open: an app URL is opened in the app window, an http(s) URL in the
+   * external browser. Other URLs are ignored. */
   url?: string;
   /** The submenus of this menu */
   submenu?: AppMenu[];
@@ -159,6 +160,7 @@ export abstract class Headlamp {
   /**
    * Changes the app menu.
    * If Headlamp is not running as a desktop app, then this method prints an error and doesn't do anything.
+   * Customizations apply to the current renderer document and must be registered again after reload.
    *
    * @param appMenuFunc A function that receives the current app menu configuration and a new one. If the function returns null, the menu is not changed.
    */

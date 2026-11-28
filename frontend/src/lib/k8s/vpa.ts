@@ -14,9 +14,9 @@
  * limitations under the License.
  */
 
-import { ResourceClasses } from '.';
 import { request } from './api/v1/clusterRequests';
-import type { KubeObjectClass, KubeObjectInterface } from './KubeObject';
+import { getResourceClass } from './getResourceClass';
+import type { KubeObjectInterface } from './KubeObject';
 import { KubeObject } from './KubeObject';
 
 type ResourceName = 'cpu' | 'memory' | 'storage' | 'ephemeral-storage';
@@ -142,16 +142,19 @@ class VPA extends KubeObject<KubeVPA> {
       return null;
     }
 
-    const TargetObjectClass = (ResourceClasses as Record<string, KubeObjectClass>)[target.kind];
+    const TargetObjectClass = getResourceClass(target.kind, target.apiVersion);
     let objInstance: KubeObject | null = null;
     if (!!TargetObjectClass) {
-      objInstance = new TargetObjectClass({
-        metadata: {
-          name: target.name,
-          namespace: target.namespace || this.metadata.namespace,
-        },
-        kind: target.kind,
-      } as KubeObjectInterface);
+      objInstance = new TargetObjectClass(
+        {
+          metadata: {
+            name: target.name,
+            namespace: target.namespace || this.metadata.namespace,
+          },
+          kind: target.kind,
+        } as KubeObjectInterface,
+        this.cluster
+      );
     }
     return objInstance;
   }

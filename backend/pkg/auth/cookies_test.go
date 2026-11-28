@@ -88,6 +88,56 @@ var isSecureContextTests = []struct {
 		expected: true,
 	},
 	{
+		name: "HTTP with X-Forwarded-Proto uppercase HTTPS",
+		setupReq: func() *http.Request {
+			req := httptest.NewRequestWithContext(context.Background(), "GET", "http://example.com", nil)
+			req.Header.Set("X-Forwarded-Proto", "HTTPS")
+
+			return req
+		},
+		expected: true,
+	},
+	{
+		name: "HTTP with X-Forwarded-Proto multi-hop https, http",
+		setupReq: func() *http.Request {
+			req := httptest.NewRequestWithContext(context.Background(), "GET", "http://example.com", nil)
+			req.Header.Set("X-Forwarded-Proto", "https, http")
+
+			return req
+		},
+		expected: true,
+	},
+	{
+		name: "HTTP with X-Forwarded-Proto multi-hop https,https",
+		setupReq: func() *http.Request {
+			req := httptest.NewRequestWithContext(context.Background(), "GET", "http://example.com", nil)
+			req.Header.Set("X-Forwarded-Proto", "https,https")
+
+			return req
+		},
+		expected: true,
+	},
+	{
+		name: "HTTP with X-Forwarded-Proto multi-hop http, https",
+		setupReq: func() *http.Request {
+			req := httptest.NewRequestWithContext(context.Background(), "GET", "http://example.com", nil)
+			req.Header.Set("X-Forwarded-Proto", "http, https")
+
+			return req
+		},
+		expected: false,
+	},
+	{
+		name: "HTTP with X-Forwarded-Proto invalid scheme",
+		setupReq: func() *http.Request {
+			req := httptest.NewRequestWithContext(context.Background(), "GET", "http://example.com", nil)
+			req.Header.Set("X-Forwarded-Proto", "ftp")
+
+			return req
+		},
+		expected: false,
+	},
+	{
 		name: "localhost HTTP",
 		setupReq: func() *http.Request {
 			req := httptest.NewRequest("GET", localhostOrigin, nil)
@@ -130,6 +180,96 @@ func TestIsSecureContext(t *testing.T) {
 			}
 		})
 	}
+}
+
+var getForwardedProtoTests = []struct {
+	name     string
+	header   string
+	expected string
+}{
+	{
+		name:     "empty header",
+		header:   "",
+		expected: "",
+	},
+	{
+		name:     "simple https",
+		header:   "https",
+		expected: "https",
+	},
+	{
+		name:     "simple http",
+		header:   "http",
+		expected: "http",
+	},
+	{
+		name:     "uppercase HTTPS",
+		header:   "HTTPS",
+		expected: "https",
+	},
+	{
+		name:     "uppercase HTTP",
+		header:   "HTTP",
+		expected: "http",
+	},
+	{
+		name:     "whitespace padding",
+		header:   "  https  ",
+		expected: "https",
+	},
+	{
+		name:     "multi-value comma-separated https, http",
+		header:   "https, http",
+		expected: "https",
+	},
+	{
+		name:     "multi-value comma-separated https,https",
+		header:   "https,https",
+		expected: "https",
+	},
+	{
+		name:     "multi-value comma-separated http, https",
+		header:   "http, https",
+		expected: "http",
+	},
+	{
+		name:     "multi-value with extra spaces",
+		header:   "  https  , http, ws",
+		expected: "https",
+	},
+	{
+		name:     "unsupported scheme ftp",
+		header:   "ftp",
+		expected: "",
+	},
+	{
+		name:     "unsupported scheme websocket",
+		header:   "ws",
+		expected: "",
+	},
+	{
+		name:     "malformed value",
+		header:   "javascript:alert(1)",
+		expected: "",
+	},
+}
+
+func TestGetForwardedProto(t *testing.T) {
+	for _, tt := range getForwardedProtoTests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequestWithContext(context.Background(), "GET", "http://example.com", nil)
+			if tt.header != "" {
+				req.Header.Set("X-Forwarded-Proto", tt.header)
+			}
+
+			result := auth.GetForwardedProto(req)
+			require.Equal(t, tt.expected, result)
+		})
+	}
+
+	t.Run("nil request", func(t *testing.T) {
+		require.Equal(t, "", auth.GetForwardedProto(nil))
+	})
 }
 
 func TestGetCookiePath(t *testing.T) {
@@ -195,6 +335,39 @@ func TestClusterURLSegmentEncoding(t *testing.T) {
 
 		if decoded != cluster {
 			t.Errorf("DecodeClusterFromURL(%q) = %q, want %q", encoded, decoded, cluster)
+		}
+	}
+}
+
+// The cluster segment is percent-encoded like browsers encode a URL path, and
+// characters browsers send unencoded are kept as is.
+func TestGetCookiePathPercentEncodesCluster(t *testing.T) {
+	for _, tt := range []struct{ baseURL, cluster, wantPath string }{
+		{"", "my cluster", "/clusters/my%20cluster"},
+		{"/headlamp", "café", "/headlamp/clusters/caf%C3%A9"},
+		{"", "prod:eu(1)!", "/clusters/prod:eu(1)!"},
+	} {
+		if got := auth.GetCookiePath(tt.baseURL, tt.cluster); got != tt.wantPath {
+			t.Errorf("GetCookiePath(%q, %q) = %q, want %q", tt.baseURL, tt.cluster, got, tt.wantPath)
+		}
+	}
+}
+
+// Browsers match a cookie's Path against the percent-encoded request path, so
+// the Set-Cookie Path must be encoded the same way for the cookie to come back.
+func TestSetTokenCookiePathIsPercentEncoded(t *testing.T) {
+	for cluster, wantPath := range map[string]string{
+		"my cluster": "/clusters/my%20cluster",
+		"café":       "/clusters/caf%C3%A9",
+	} {
+		req := httptest.NewRequestWithContext(context.Background(), "GET", localhost, nil)
+		req.Host = localhost
+		w := httptest.NewRecorder()
+
+		require.NoError(t, auth.SetTokenCookie(w, req, cluster, "test-token", "", 100))
+
+		for _, header := range w.Result().Header.Values("Set-Cookie") {
+			require.Contains(t, header, "; Path="+wantPath+";", "cluster %q", cluster)
 		}
 	}
 }

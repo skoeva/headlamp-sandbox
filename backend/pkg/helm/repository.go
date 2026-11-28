@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -63,8 +64,30 @@ func (r AddUpdateRepoRequest) Validate() error {
 		return errors.New("name is required")
 	}
 
+	if strings.ContainsAny(r.Name, `/\`) || strings.Contains(r.Name, "..") {
+		return errors.New("name must not contain path separators or '..'")
+	}
+
 	if strings.TrimSpace(r.URL) == "" {
 		return errors.New("url is required")
+	}
+
+	u, err := url.ParseRequestURI(r.URL)
+	if err != nil {
+		return errors.New("invalid url")
+	}
+
+	scheme := strings.ToLower(u.Scheme)
+	if scheme == "oci" {
+		return errors.New("OCI registries can't be added as repositories")
+	}
+
+	if scheme != "http" && scheme != "https" {
+		return errors.New("url scheme must be http or https")
+	}
+
+	if u.Hostname() == "" {
+		return errors.New("url host is required")
 	}
 
 	return nil
@@ -97,6 +120,7 @@ func lockRepositoryFile(lockCtx context.Context, repositoryConfig string) (bool,
 
 	fileLock := flock.New(lockPath)
 
+	// The context bounds the total wait; this duration controls how often the lock is retried.
 	locked, err := fileLock.TryLockContext(lockCtx, time.Second)
 
 	return locked, fileLock, err
@@ -204,6 +228,27 @@ func addRepository(request AddUpdateRepoRequest, settings *cli.EnvSettings) erro
 	return nil
 }
 
+// writeJSONResponse encodes data as JSON and writes it to w with the given
+// HTTP status. Encoding is buffered so errors are caught before headers are
+// sent.
+func writeJSONResponse(w http.ResponseWriter, status int, data interface{}) {
+	var buf bytes.Buffer
+
+	if err := json.NewEncoder(&buf).Encode(data); err != nil {
+		logger.Log(logger.LevelError, nil, err, "encoding response")
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+
+	if _, err := w.Write(buf.Bytes()); err != nil {
+		logger.Log(logger.LevelError, nil, err, "writing response")
+	}
+}
+
 func (h *Handler) AddRepo(w http.ResponseWriter, r *http.Request) {
 	var request AddUpdateRepoRequest
 
@@ -232,21 +277,7 @@ func (h *Handler) AddRepo(w http.ResponseWriter, r *http.Request) {
 		"message": "success",
 	}
 
-	var buf bytes.Buffer
-
-	if err = json.NewEncoder(&buf).Encode(response); err != nil {
-		logger.Log(logger.LevelError, nil, err, "encoding response")
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-
-	if _, err = w.Write(buf.Bytes()); err != nil {
-		logger.Log(logger.LevelError, nil, err, "writing response")
-	}
+	writeJSONResponse(w, http.StatusOK, response)
 }
 
 type repositoryInfo struct {
@@ -302,21 +333,7 @@ func (h *Handler) ListRepo(w http.ResponseWriter, r *http.Request) {
 		Repositories: repositories,
 	}
 
-	var buf bytes.Buffer
-
-	if err = json.NewEncoder(&buf).Encode(response); err != nil {
-		logger.Log(logger.LevelError, nil, err, "encoding response")
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-
-	if _, err = w.Write(buf.Bytes()); err != nil {
-		logger.Log(logger.LevelError, nil, err, "writing response")
-	}
+	writeJSONResponse(w, http.StatusOK, response)
 }
 
 func RemoveRepository(name string, settings *cli.EnvSettings) error {

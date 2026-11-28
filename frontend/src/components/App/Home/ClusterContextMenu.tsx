@@ -15,7 +15,16 @@
  */
 
 import { Icon } from '@iconify/react';
-import { Box, DialogContentText } from '@mui/material';
+import {
+  Box,
+  Button,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogContentText,
+  DialogTitle,
+  Typography,
+} from '@mui/material';
 import IconButton from '@mui/material/IconButton';
 import ListItemText from '@mui/material/ListItemText';
 import Menu from '@mui/material/Menu';
@@ -27,14 +36,42 @@ import { useTranslation } from 'react-i18next';
 import { useDispatch } from 'react-redux';
 import { useHistory } from 'react-router-dom';
 import helpers from '../../../helpers';
+import {
+  getClusterField,
+  getClusterSource,
+  getClusterSourceLabel,
+  translateClusterLabel,
+} from '../../../helpers/clusterPresentation';
+import { useClusterPresentation } from '../../../helpers/useClusterPresentation';
 import { deleteCluster } from '../../../lib/k8s/api/v1/clusterApi';
 import { Cluster } from '../../../lib/k8s/cluster';
 import { createRouteURL } from '../../../lib/router/createRouteURL';
 import { useId } from '../../../lib/util';
+import { BUILT_IN_DELETE_DIALOG, ClusterDeleteHandler } from '../../../redux/clusterProviderSlice';
 import { setConfig } from '../../../redux/configSlice';
 import { useTypedSelector } from '../../../redux/hooks';
+import { enqueueConfigOperation } from '../../../stateless/configOperationQueue';
 import { ConfirmDialog } from '../../common/ConfirmDialog';
 import ErrorBoundary from '../../common/ErrorBoundary/ErrorBoundary';
+import CopyButton from '../../common/Resource/CopyButton';
+import ClusterTagsDialog from '../Settings/ClusterTagsEditor';
+
+/**
+ * The dialog of the first plugin delete handler that owns the cluster, or null when no plugin
+ * owns it. A handler that throws owns nothing.
+ */
+function findPluginDeleteDialog(handlers: ClusterDeleteHandler[], cluster: Cluster): string | null {
+  for (const handler of handlers) {
+    try {
+      if (handler.owns(cluster)) {
+        return handler.dialog;
+      }
+    } catch (err) {
+      console.error('Cluster delete handler failed', err);
+    }
+  }
+  return null;
+}
 
 interface ClusterContextMenuProps {
   /** The cluster for the context menu to act on. */
@@ -51,28 +88,44 @@ export default function ClusterContextMenu({
   onClusterRemoved = () => window.location.reload(),
 }: ClusterContextMenuProps) {
   const { t } = useTranslation(['translation']);
+  const { getLabel, sources } = useClusterPresentation();
+  const [detailsOpen, setDetailsOpen] = React.useState(false);
+  const source = sources.find(view => view.id === getClusterSource(cluster));
+  const detailFields = [...(source?.columns || []), ...(source?.detailFields || [])];
   const history = useHistory();
   const dispatch = useDispatch();
   const [anchorEl, setAnchorEl] = React.useState<null | HTMLElement>(null);
   const menuId = useId('context-menu');
   const [openConfirmDialog, setOpenConfirmDialog] = React.useState<string | null>(null);
+  const [tagsDialogOpen, setTagsDialogOpen] = React.useState(false);
   const dialogs = useTypedSelector(state => state.clusterProvider.dialogs);
   const menuItems = useTypedSelector(state => state.clusterProvider.menuItems);
+  const deleteHandlers = useTypedSelector(state => state.clusterProvider.deleteHandlers);
   const isDynamicClusterEnabled = useTypedSelector(state => state.config.isDynamicClusterEnabled);
   const allowKubeconfigChanges = useTypedSelector(state => state.config.allowKubeconfigChanges);
   const { enqueueSnackbar } = useSnackbar();
 
   const kubeconfigOrigin = cluster.meta_data?.origin?.kubeconfig;
   const deleteFromKubeconfig = cluster.meta_data?.source === 'kubeconfig';
+  // A plugin that owns this cluster handles its Delete with the plugin's own dialog.
+  const pluginDeleteDialog = findPluginDeleteDialog(deleteHandlers, cluster);
 
   function removeCluster(cluster: Cluster) {
     const clusterID = cluster.meta_data?.clusterID;
     const originalName = cluster.meta_data?.originalName ?? '';
     const clusterName = cluster.name;
 
-    deleteCluster(clusterName, deleteFromKubeconfig, clusterID, kubeconfigOrigin, originalName)
-      .then(config => {
-        dispatch(setConfig(config));
+    enqueueConfigOperation(async () => {
+      const config = await deleteCluster(
+        clusterName,
+        deleteFromKubeconfig,
+        clusterID,
+        kubeconfigOrigin,
+        originalName
+      );
+      dispatch(setConfig(config));
+    })
+      .then(() => {
         onClusterRemoved();
       })
       .catch((err: Error) => {
@@ -164,20 +217,37 @@ export default function ClusterContextMenu({
         >
           <ListItemText>{t('translation|Settings')}</ListItemText>
         </MenuItem>
-        {(!menuItems || menuItems.length === 0) &&
-          ((cluster.meta_data?.source === 'dynamic_cluster' &&
-            (helpers.isElectron() || isDynamicClusterEnabled)) ||
-            (cluster.meta_data?.source === 'kubeconfig' &&
-              (helpers.isElectron() || allowKubeconfigChanges))) && (
-            <MenuItem
-              onClick={() => {
-                setOpenConfirmDialog('deleteDynamic');
-                handleMenuClose();
-              }}
-            >
-              <ListItemText>{t('translation|Delete')}</ListItemText>
-            </MenuItem>
-          )}
+        <MenuItem
+          onClick={() => {
+            setDetailsOpen(true);
+            handleMenuClose();
+          }}
+        >
+          <ListItemText>{t('Connection details')}</ListItemText>
+        </MenuItem>
+        <MenuItem
+          onClick={() => {
+            setTagsDialogOpen(true);
+            handleMenuClose();
+          }}
+        >
+          <ListItemText>{t('translation|Edit tags')}</ListItemText>
+        </MenuItem>
+        {(pluginDeleteDialog !== null ||
+          ((!menuItems || menuItems.length === 0) &&
+            ((cluster.meta_data?.source === 'dynamic_cluster' &&
+              (helpers.isElectron() || isDynamicClusterEnabled)) ||
+              (cluster.meta_data?.source === 'kubeconfig' &&
+                (helpers.isElectron() || allowKubeconfigChanges))))) && (
+          <MenuItem
+            onClick={() => {
+              setOpenConfirmDialog(pluginDeleteDialog ?? BUILT_IN_DELETE_DIALOG);
+              handleMenuClose();
+            }}
+          >
+            <ListItemText>{t('translation|Delete')}</ListItemText>
+          </MenuItem>
+        )}
         {menuItems.map((Item, index) => {
           return (
             <Item
@@ -189,8 +259,52 @@ export default function ClusterContextMenu({
           );
         })}
       </Menu>
+      <Dialog
+        open={detailsOpen}
+        onClose={() => setDetailsOpen(false)}
+        fullWidth
+        maxWidth="sm"
+        aria-labelledby={`${menuId}-details`}
+      >
+        <DialogTitle id={`${menuId}-details`}>{t('Connection details')}</DialogTitle>
+        <DialogContent sx={{ overflowWrap: 'anywhere' }}>
+          <Typography variant="h6">{getLabel(cluster).name}</Typography>
+          <Typography color="text.secondary">
+            {translateClusterLabel(getClusterSourceLabel(cluster, sources), t)}
+          </Typography>
+          <Box component="dl" sx={{ '& dt': { mt: 2, color: 'text.secondary' }, '& dd': { m: 0 } }}>
+            <dt>{t('Connection ID')}</dt>
+            <dd>
+              {cluster.name}
+              <CopyButton text={cluster.name} />
+            </dd>
+            {cluster.server && (
+              <>
+                <dt>{t('API server')}</dt>
+                <dd>{cluster.server}</dd>
+              </>
+            )}
+            {detailFields.map(column => (
+              <React.Fragment key={column.key}>
+                <dt>{translateClusterLabel(column.label, t)}</dt>
+                <dd>{getClusterField(cluster, column.key) || '—'}</dd>
+              </React.Fragment>
+            ))}
+            {getClusterField(cluster, 'root') &&
+              !detailFields.some(field => field.key === 'root') && (
+                <>
+                  <dt>{t('Management context')}</dt>
+                  <dd>{getClusterField(cluster, 'root')}</dd>
+                </>
+              )}
+          </Box>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setDetailsOpen(false)}>{t('Close')}</Button>
+        </DialogActions>
+      </Dialog>
       <ConfirmDialog
-        open={openConfirmDialog === 'deleteDynamic'}
+        open={openConfirmDialog === BUILT_IN_DELETE_DIALOG}
         handleClose={() => setOpenConfirmDialog('')}
         confirmLabel={t('translation|Delete')}
         onConfirm={() => {
@@ -199,6 +313,12 @@ export default function ClusterContextMenu({
         }}
         title={t('translation|Delete Cluster')}
         description={removeClusterDescription(cluster)}
+      />
+      <ClusterTagsDialog
+        open={tagsDialogOpen}
+        cluster={cluster.name}
+        clusterInfo={cluster}
+        onClose={() => setTagsDialogOpen(false)}
       />
       {openConfirmDialog !== null &&
         dialogs.map((Dialog, index) => {

@@ -19,12 +19,19 @@ import {
   clearResolvedAllowedNamespaces,
   ClusterSettings,
   getCombinedAllowedNamespaces,
+  getDiscoveredNamespaces,
+  getDiscoveredNamespacesVersion,
+  getDiscoveryGeneration,
   hasAllowedNamespacesRestriction,
   isResolvedAllowedNamespacesStale,
   loadClusterSettings,
   loadResolvedAllowedNamespaces,
+  resetDiscoveredNamespaces,
+  setDiscoveredNamespaces,
   storeClusterSettings,
   storeResolvedAllowedNamespaces,
+  subscribeDiscoveredNamespaces,
+  subscribeToClusterSettings,
 } from './clusterSettings';
 
 describe('clusterSettings', () => {
@@ -33,6 +40,45 @@ describe('clusterSettings', () => {
   });
 
   describe('storeClusterSettings', () => {
+    it('subscribes to cross-tab namespace settings and cache changes, filters unrelated storage, and cleans up', () => {
+      const listener = vi.fn();
+      const unsubscribe = subscribeToClusterSettings(listener);
+      const storageEvent = (key: string | null, storageArea: Storage = localStorage) => {
+        const event = new StorageEvent('storage', { key });
+        // The test storage is not a native jsdom Storage.
+        Object.defineProperty(event, 'storageArea', { value: storageArea });
+        window.dispatchEvent(event);
+      };
+
+      storageEvent('cluster_settings.prod');
+      storageEvent('cluster_allowed_namespaces_selector_cache.prod');
+      storageEvent(null);
+      const relevantNotifications = listener.mock.calls.length;
+      storageEvent('unrelated');
+      storageEvent('cluster_settings.prod', sessionStorage);
+      const notificationsAfterUnrelatedEvents = listener.mock.calls.length;
+
+      unsubscribe();
+      storageEvent('cluster_settings.prod');
+      storageEvent(null);
+      expect(relevantNotifications).toBe(3);
+      expect(notificationsAfterUnrelatedEvents).toBe(3);
+      expect(listener).toHaveBeenCalledTimes(3);
+    });
+
+    it('notifies subscribers after persisting settings and stops notifying after unsubscribe', () => {
+      const observed: ClusterSettings[] = [];
+      const unsubscribe = subscribeToClusterSettings(() =>
+        observed.push(loadClusterSettings('prod'))
+      );
+
+      storeClusterSettings('prod', { allowedNamespacesSelector: 'team=frontend' });
+      unsubscribe();
+      storeClusterSettings('prod', {});
+
+      expect(observed).toEqual([{ allowedNamespacesSelector: 'team=frontend' }]);
+    });
+
     it('writes the settings under cluster_settings.<name>', () => {
       const settings: ClusterSettings = { defaultNamespace: 'kube-system' };
 
@@ -256,6 +302,76 @@ describe('clusterSettings', () => {
       storeClusterSettings('prod', { allowedNamespacesSelector: 'team=frontend' });
       storeResolvedAllowedNamespaces('prod', 'team=frontend', []);
       expect(hasAllowedNamespacesRestriction('prod')).toBe(true);
+    });
+  });
+
+  describe('discovered namespaces', () => {
+    afterEach(() => {
+      setDiscoveredNamespaces('prod', null);
+      setDiscoveredNamespaces('dev', null);
+    });
+
+    it('are used when no namespaces are configured', () => {
+      setDiscoveredNamespaces('prod', ['b', 'a', 'a']);
+      expect(getDiscoveredNamespaces('prod')).toEqual(['a', 'b']);
+      expect(getCombinedAllowedNamespaces('prod')).toEqual(['a', 'b']);
+      expect(hasAllowedNamespacesRestriction('prod')).toBe(true);
+    });
+
+    it('restrict the cluster even when empty', () => {
+      setDiscoveredNamespaces('prod', []);
+      expect(getCombinedAllowedNamespaces('prod')).toEqual([]);
+      expect(hasAllowedNamespacesRestriction('prod')).toBe(true);
+    });
+
+    it('are ignored when namespaces are configured manually', () => {
+      storeClusterSettings('prod', { allowedNamespaces: ['manual'] });
+      setDiscoveredNamespaces('prod', ['discovered']);
+      expect(getCombinedAllowedNamespaces('prod')).toEqual(['manual']);
+    });
+
+    it('are ignored when a selector is configured', () => {
+      storeClusterSettings('prod', { allowedNamespacesSelector: 'team=frontend' });
+      storeResolvedAllowedNamespaces('prod', 'team=frontend', ['selected']);
+      setDiscoveredNamespaces('prod', ['discovered']);
+      expect(getCombinedAllowedNamespaces('prod')).toEqual(['selected']);
+    });
+
+    it('can be cleared', () => {
+      setDiscoveredNamespaces('prod', ['a']);
+      setDiscoveredNamespaces('prod', null);
+      expect(getDiscoveredNamespaces('prod')).toBeUndefined();
+      expect(hasAllowedNamespacesRestriction('prod')).toBe(false);
+    });
+
+    it('notifies subscribers on changes only', () => {
+      const listener = vi.fn();
+      const unsubscribe = subscribeDiscoveredNamespaces(listener);
+      const version = getDiscoveredNamespacesVersion();
+
+      setDiscoveredNamespaces('prod', ['b', 'a']);
+      setDiscoveredNamespaces('prod', ['a', 'b']);
+      expect(listener).toHaveBeenCalledTimes(1);
+      expect(getDiscoveredNamespacesVersion()).toBe(version + 1);
+
+      unsubscribe();
+      setDiscoveredNamespaces('prod', null);
+      expect(listener).toHaveBeenCalledTimes(1);
+    });
+
+    it('reset clears one or all clusters and starts a new generation', () => {
+      const generation = getDiscoveryGeneration();
+      setDiscoveredNamespaces('prod', ['a']);
+      setDiscoveredNamespaces('dev', ['b']);
+
+      resetDiscoveredNamespaces('prod');
+      expect(getDiscoveredNamespaces('prod')).toBeUndefined();
+      expect(getDiscoveredNamespaces('dev')).toEqual(['b']);
+      expect(getDiscoveryGeneration()).toBe(generation + 1);
+
+      resetDiscoveredNamespaces();
+      expect(getDiscoveredNamespaces('dev')).toBeUndefined();
+      expect(getDiscoveryGeneration()).toBe(generation + 2);
     });
   });
 

@@ -25,8 +25,7 @@ import { generatePath, useHistory, useLocation } from 'react-router-dom';
 import { getAppUrl } from '../../helpers/getAppUrl';
 import { getCluster, getClusterPrefixedPath } from '../../lib/cluster';
 import { useClustersConf } from '../../lib/k8s';
-import { testAuth } from '../../lib/k8s/api/v1/clusterApi';
-import { invalidateClusterUserInfo } from '../../lib/queryClient';
+import { invalidateClusterUserInfo, resetAccessibleNamespaces } from '../../lib/queryClient';
 import { createRouteURL } from '../../lib/router/createRouteURL';
 import { getRoute } from '../../lib/router/getRoute';
 import { getRoutePath } from '../../lib/router/getRoutePath';
@@ -38,6 +37,7 @@ import Empty from '../common/EmptyContent';
 import Link from '../common/Link';
 import Loader from '../common/Loader';
 import OauthPopup from '../oidcauth/OauthPopup';
+import { testAuthWithRetry, TRANSIENT_STATUSES } from './testAuthWithRetry';
 
 function ColorButton({ children, ...rest }: ComponentProps<typeof Button>) {
   return (
@@ -118,14 +118,14 @@ function AuthChooser({ children }: AuthChooserProps) {
         return;
       }
 
-      if (clusterAuthType === 'oidc' && oidcAutoLogin) {
+      if (clusterAuthType === 'oidc' && oidcAutoLogin && !cluster.uses_service_account_token) {
         const urlParams = new URLSearchParams(location.search);
         const isLoggingOut = urlParams.get('logout') === 'true';
 
         if (!isLoggingOut && !oidcTokenRejected) {
           setTestingAuth(true);
 
-          testAuth(clusterName)
+          testAuthWithRetry(clusterName)
             .then(() => {
               if (!cancelledRef.current) {
                 history.replace(from);
@@ -175,8 +175,14 @@ function AuthChooser({ children }: AuthChooserProps) {
       //   cluster, then we check here.
       // With clusterAuthType == oidc,
       //   they are presented with a choice of login or enter token.
-      if (clusterAuthType !== 'oidc' && cluster.useToken === undefined) {
-        let useToken = true;
+      if (
+        (clusterAuthType !== 'oidc' || cluster.uses_service_account_token) &&
+        (cluster.useToken === undefined || cluster.uses_service_account_token)
+      ) {
+        // Running in-cluster with --unsafe-use-service-account-token, the backend
+        // authenticates every request with the pod's own service account and discards
+        // whatever token the user supplies. Asking for one cannot change the outcome.
+        let useToken = !cluster.uses_service_account_token;
 
         setTestingAuth(true);
 
@@ -184,20 +190,30 @@ function AuthChooser({ children }: AuthChooserProps) {
 
         console.debug('Testing auth at authchooser');
 
-        testAuth(clusterName)
+        testAuthWithRetry(clusterName)
           .then(() => {
             console.debug('Not requiring token as testing auth succeeded');
             useToken = false;
           })
           .catch(err => {
             if (!cancelledRef.current) {
-              console.debug(`Requiring token for ${clusterName} as testing auth failed:`, err);
-
               // Ideally we'd only not assign the error if it was 401 or 403 (so we let the logic
               // proceed to request a token), but let's first check whether this is all we get
               // from clusters that require a token.
-              if ([408, 504, 502].includes(err.status)) {
+              if (TRANSIENT_STATUSES.includes(err.status)) {
+                // The request did not reach the cluster, so whether a token is needed is still
+                // unknown. Surfacing this as a connection error keeps it apart from the auth
+                // failures below, which do require one.
+                console.debug(`Could not reach ${clusterName} while testing auth:`, err);
                 errorObj = err;
+              } else if (cluster.uses_service_account_token) {
+                // A user token is never applied to this cluster, so asking for one is not a
+                // recovery. The failure is the answer, and hiding it would send the user on
+                // into a cluster they cannot read.
+                console.debug(`Auth failed for ${clusterName} and no token can be applied:`, err);
+                errorObj = err;
+              } else {
+                console.debug(`Requiring token for ${clusterName} as testing auth failed:`, err);
               }
 
               setTestingAuth(false);
@@ -289,10 +305,19 @@ function AuthChooser({ children }: AuthChooserProps) {
         // Invalidate every cluster's cached identity, not just this one: the
         // backend may have broadcast the new token to sibling clusters.
         invalidateClusterUserInfo();
+        // Discovered namespaces belong to the previous identity, on every cluster.
+        resetAccessibleNamespaces();
         history.replace(from);
       }}
       handleBackButtonPress={() => {
-        numClusters > 1 ? history.goBack() : history.push('/');
+        // Both of these led straight back here: going back re-entered the cluster
+        // whose auth had just failed, and '/' bounced a lone cluster back in, so
+        // the only way out was to exhaust the history. Leave for the chooser
+        // instead, and tell it not to send a lone cluster back.
+        history.push({
+          pathname: createRouteURL('chooser'),
+          state: { fromAuthChooser: true },
+        });
       }}
       handleTokenAuth={() => {
         const tokenRoute = getRoute('token');

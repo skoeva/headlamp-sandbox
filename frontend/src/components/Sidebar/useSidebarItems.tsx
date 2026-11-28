@@ -15,21 +15,26 @@
  */
 
 import { useTheme } from '@mui/material/styles';
-import { useQuery } from '@tanstack/react-query';
 import _ from 'lodash';
 import React, { useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import { getClusterAppearanceFromMeta } from '../../helpers/clusterAppearance';
+import { hasConfiguredClusterSources } from '../../helpers/clusterPresentation';
 import { isElectron } from '../../helpers/isElectron';
+import { useClusterPresentation } from '../../helpers/useClusterPresentation';
 import { useClustersConf, useSelectedClusters } from '../../lib/k8s';
-import CompositePodGroup from '../../lib/k8s/compositePodGroup';
+import ClusterTrustBundle from '../../lib/k8s/clusterTrustBundle';
 import CRD from '../../lib/k8s/crd';
 import DeviceClass from '../../lib/k8s/deviceClass';
 import { useGatewayL4RouteAvailability } from '../../lib/k8s/gatewayL4RouteAvailability';
-import PodGroup from '../../lib/k8s/podGroup';
 import { useIsResourceServed } from '../../lib/k8s/resourceAvailability';
+import {
+  useCompositePodGroupClusters,
+  useSchedulingApisEnabled,
+} from '../../lib/k8s/schedulingApis';
 import { createRouteURL } from '../../lib/router/createRouteURL';
 import { useTypedSelector } from '../../redux/hooks';
+import { selectEffectiveSettings } from '../../settings/useAdminSettings';
 import { DefaultSidebars, SidebarEntryProps, SidebarItemProps } from '.';
 import ClusterBadge from './ClusterBadge';
 
@@ -60,11 +65,13 @@ const sortSidebarItems = (items: SidebarItemProps[]): SidebarItemProps[] => {
 
 export const useSidebarItems = (sidebarName: string = DefaultSidebars.IN_CLUSTER) => {
   const clusters = useTypedSelector(state => state.config.clusters) ?? {};
-  const settings = useTypedSelector(state => state.config.settings);
+  const settings = useTypedSelector(selectEffectiveSettings);
   const customSidebarEntries = useTypedSelector(state => state.sidebar.entries);
   const customSidebarFilters = useTypedSelector(state => state.sidebar.filters);
   const customHomeSidebarFilters = useTypedSelector(state => state.sidebar.homeFilters);
-  const shouldShowHomeItem = isElectron() || Object.keys(clusters).length !== 1;
+  const { getLabel, sources } = useClusterPresentation();
+  const shouldShowHomeItem =
+    isElectron() || Object.keys(clusters).length !== 1 || hasConfiguredClusterSources(sources);
   const selectedClusters = useSelectedClusters();
   const allClustersConf = useClustersConf();
   const { t } = useTranslation();
@@ -81,18 +88,11 @@ export const useSidebarItems = (sidebarName: string = DefaultSidebars.IN_CLUSTER
     console.error('Failed to fetch CRDs:', error);
   }
 
-  // The workload aware scheduling APIs are alpha and are only served when the cluster
-  // enables the GenericWorkload feature gate, so only show them when they are available.
-  const { data: schedulingWorkloadsEnabled = false } = useQuery({
-    queryKey: ['schedulingWorkloadsEnabled', ...selectedClusters],
-    queryFn: async () => {
-      const enabledPerCluster = await Promise.all(
-        selectedClusters.map(cluster => PodGroup.isEnabled(cluster))
-      );
-      return enabledPerCluster.some(Boolean);
-    },
-    enabled: selectedClusters.length > 0,
-  });
+  const schedulingWorkloadsEnabled = useSchedulingApisEnabled();
+
+  // Trust bundles sit behind their own feature gate, so only offer them on clusters
+  // that actually serve the resource.
+  const clusterTrustBundlesEnabled = useIsResourceServed(ClusterTrustBundle);
 
   // Dynamic resource allocation is stable from Kubernetes 1.34, so only show the
   // Devices section on clusters that serve resource.k8s.io/v1.
@@ -100,16 +100,7 @@ export const useSidebarItems = (sidebarName: string = DefaultSidebars.IN_CLUSTER
 
   // CompositePodGroup needs its own feature gate on top, and unlike the flat resources
   // it is only ever served by v1alpha3, so ask for the resource itself.
-  const { data: compositePodGroupsEnabled = false } = useQuery({
-    queryKey: ['compositePodGroupsEnabled', ...selectedClusters],
-    queryFn: async () => {
-      const enabledPerCluster = await Promise.all(
-        selectedClusters.map(cluster => CompositePodGroup.isEnabled(cluster))
-      );
-      return enabledPerCluster.some(Boolean);
-    },
-    enabled: selectedClusters.length > 0,
-  });
+  const compositePodGroupsEnabled = useCompositePodGroupClusters().length > 0;
 
   const crdsSidebarEntries = useMemo(() => {
     const crdsSidebarEntries: SidebarItemProps[] = [];
@@ -177,7 +168,8 @@ export const useSidebarItems = (sidebarName: string = DefaultSidebars.IN_CLUSTER
             return (
               <ClusterBadge
                 key={clusterName}
-                name={clusterName}
+                name={getLabel(clusterName).name}
+                secondary={getLabel(clusterName).secondary}
                 accentColor={
                   appearance.accentColor ||
                   theme.palette.getContrastText(theme.palette.text.primary)
@@ -425,6 +417,18 @@ export const useSidebarItems = (sidebarName: string = DefaultSidebars.IN_CLUSTER
             name: 'serviceAccounts',
             label: t('glossary|Service Accounts'),
           },
+          ...(clusterTrustBundlesEnabled
+            ? [
+                {
+                  name: 'clusterTrustBundles',
+                  label: t('glossary|Cluster Trust Bundles'),
+                },
+              ]
+            : []),
+          {
+            name: 'certificateSigningRequests',
+            label: t('glossary|Certificate Signing Requests'),
+          },
           {
             name: 'roles',
             label: t('glossary|Roles'),
@@ -485,6 +489,14 @@ export const useSidebarItems = (sidebarName: string = DefaultSidebars.IN_CLUSTER
             label: t('glossary|Mutating Webhook Configurations'),
           },
           {
+            name: 'mutatingAdmissionPolicies',
+            label: t('glossary|Mutating Admission Policies'),
+          },
+          {
+            name: 'mutatingAdmissionPolicyBindings',
+            label: t('glossary|Mutating Admission Policy Bindings'),
+          },
+          {
             name: 'validatingWebhookConfigurations',
             label: t('glossary|Validating Webhook Configurations'),
           },
@@ -509,6 +521,10 @@ export const useSidebarItems = (sidebarName: string = DefaultSidebars.IN_CLUSTER
           {
             name: 'resourceClaimTemplates',
             label: t('glossary|Resource Claim Templates'),
+          },
+          {
+            name: 'resourceSlices',
+            label: t('glossary|Resource Slices'),
           },
         ],
       });
@@ -664,8 +680,11 @@ export const useSidebarItems = (sidebarName: string = DefaultSidebars.IN_CLUSTER
     // eslint-disable-next-line react-hooks/exhaustive-deps
     selectedClusters.join(','),
     allClustersConf,
+    sources,
+    getLabel,
     crdsSidebarEntries,
     gatewayKinds,
+    clusterTrustBundlesEnabled,
     devicesEnabled,
     schedulingWorkloadsEnabled,
     compositePodGroupsEnabled,

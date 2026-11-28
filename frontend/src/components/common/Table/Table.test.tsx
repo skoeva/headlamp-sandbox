@@ -16,12 +16,14 @@
 
 import { ThemeProvider } from '@mui/material/styles';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { MRT_VisibilityState } from 'material-react-table';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createMuiTheme } from '../../../lib/themes';
 import Table, { TableProps } from './Table';
 
 const { tableMocks } = vi.hoisted(() => ({
   tableMocks: {
+    bodyCellRenders: 0,
     cellContext: 'plain' as 'dialog' | 'plain' | 'switch',
     columnVisibility: {} as Record<string, boolean>,
     forceNoRows: false,
@@ -64,6 +66,7 @@ vi.mock('./ColumnVisibilityButton', () => ({
 vi.mock('material-react-table', () => ({
   MRT_BottomToolbar: () => <div data-testid="bottom-toolbar" />,
   MRT_TableBodyCell: ({ cell }: any) => {
+    tableMocks.bodyCellRenders++;
     const checkbox = <input aria-label={`Custom selection for ${cell.row.id}`} type="checkbox" />;
     return (
       <td>
@@ -88,6 +91,7 @@ vi.mock('material-react-table', () => ({
     const rows = options.data.map((item: Record<string, unknown>, index: number) => {
       const row: any = {
         id: String(index),
+        original: item,
         getCanSelect: () => true,
         getIsSelected: () => false,
       };
@@ -111,6 +115,7 @@ vi.mock('material-react-table', () => ({
               id: 'selection',
               column: {
                 id: 'selection',
+                columnDef: options.columns[0],
                 getFilterValue: () => undefined,
                 getIsFiltered: () => false,
                 getIsSorted: () => false,
@@ -220,6 +225,7 @@ function toolbarTable(selectedRows: object[] = []) {
 }
 
 beforeEach(() => {
+  tableMocks.bodyCellRenders = 0;
   tableMocks.cellContext = 'plain';
   tableMocks.columnVisibility = {};
   tableMocks.forceNoRows = false;
@@ -238,6 +244,205 @@ describe('Table toolbar and selection props', () => {
     renderTable(props);
 
     expect(screen.getByTestId('top-toolbar')).toBeVisible();
+  });
+
+  it('forwards visibility changes so a caller can save and restore its columns', () => {
+    const onColumnVisibilityChange = vi.fn();
+    renderTable({ state: { columnVisibility: { detail: false } }, onColumnVisibilityChange });
+    tableMocks.options.onColumnVisibilityChange({ detail: true });
+    expect(onColumnVisibilityChange).toHaveBeenCalledWith({ detail: true });
+    expect(tableMocks.options.state.columnVisibility.detail).toBe(false);
+  });
+
+  it('treats equal keys in a complete controlled update as explicit assignments', () => {
+    const onColumnVisibilityChange = vi.fn();
+    renderTable({
+      state: { columnVisibility: { detail: false } },
+      onColumnVisibilityChange,
+    });
+
+    act(() => tableMocks.options.onColumnVisibilityChange({ detail: false }));
+
+    expect(onColumnVisibilityChange).toHaveBeenCalledWith({ detail: false });
+  });
+
+  it('lets local visibility toggles override caller defaults without a change callback', () => {
+    renderTable({ state: { columnVisibility: { cluster: true } } });
+    expect(tableMocks.options.state.columnVisibility.cluster).toBe(true);
+
+    act(() => tableMocks.options.onColumnVisibilityChange({ cluster: false }));
+    expect(tableMocks.options.state.columnVisibility.cluster).toBe(false);
+
+    act(() => {
+      tableMocks.options.onColumnVisibilityChange((previous: Record<string, boolean>) => ({
+        ...previous,
+        cluster: true,
+      }));
+    });
+    expect(tableMocks.options.state.columnVisibility.cluster).toBe(true);
+  });
+
+  it('treats keys omitted by a visibility reset as visible', () => {
+    renderTable({ state: { columnVisibility: { detail: false } } });
+
+    act(() => tableMocks.options.onColumnVisibilityChange(() => ({})));
+
+    expect(tableMocks.options.state.columnVisibility.detail).toBe(true);
+  });
+
+  it('waits for controlled caller acceptance before applying a visibility choice', () => {
+    const onColumnVisibilityChange = vi.fn();
+    const props = {
+      columns: [{ id: 'detail', accessorKey: 'selected', header: 'Detail' }],
+      data: [{ selected: false }],
+      onColumnVisibilityChange,
+      state: { columnVisibility: { detail: true } },
+    };
+    const { rerender } = renderTable(props);
+
+    act(() =>
+      tableMocks.options.onColumnVisibilityChange((previous: Record<string, boolean>) => ({
+        ...previous,
+        detail: false,
+      }))
+    );
+    expect(tableMocks.options.state.columnVisibility.detail).toBe(true);
+
+    rerender(
+      <ThemeProvider theme={theme}>
+        <Table {...props} state={{ columnVisibility: { detail: true } }} />
+      </ThemeProvider>
+    );
+
+    expect(tableMocks.options.state.columnVisibility.detail).toBe(true);
+  });
+
+  it('evaluates consecutive functional visibility updates from queued state', () => {
+    const callbacks: Array<
+      MRT_VisibilityState | ((old: MRT_VisibilityState) => MRT_VisibilityState)
+    > = [];
+    renderTable({
+      state: { columnVisibility: {} },
+      onColumnVisibilityChange: updater => callbacks.push(updater),
+    });
+
+    act(() => {
+      tableMocks.options.onColumnVisibilityChange((old: Record<string, boolean>) => ({
+        ...old,
+        selected: false,
+      }));
+      tableMocks.options.onColumnVisibilityChange((old: Record<string, boolean>) => ({
+        ...old,
+        name: false,
+      }));
+    });
+
+    const accepted = callbacks.reduce<MRT_VisibilityState>(
+      (state, updater) => (typeof updater === 'function' ? updater(state) : updater),
+      {} as MRT_VisibilityState
+    );
+    expect(accepted).toMatchObject({ selected: false, name: false });
+  });
+
+  it('toggles a column twice in one event back to where it was', () => {
+    const callbacks: Array<
+      MRT_VisibilityState | ((old: MRT_VisibilityState) => MRT_VisibilityState)
+    > = [];
+    renderTable({
+      state: { columnVisibility: { detail: true } },
+      onColumnVisibilityChange: updater => callbacks.push(updater),
+    });
+
+    act(() => {
+      const toggle = (old: MRT_VisibilityState) => ({ ...old, detail: old.detail === false });
+      tableMocks.options.onColumnVisibilityChange(toggle);
+      tableMocks.options.onColumnVisibilityChange(toggle);
+    });
+
+    const accepted = callbacks.reduce<MRT_VisibilityState>(
+      (state, updater) => (typeof updater === 'function' ? updater(state) : updater),
+      { detail: true }
+    );
+    expect(accepted.detail).toBe(true);
+  });
+
+  it('keeps the caller action columns in a complete controlled update', () => {
+    const onColumnVisibilityChange = vi.fn();
+    renderTable({
+      enableRowActions: true,
+      state: { columnVisibility: { 'mrt-row-actions': false } },
+      onColumnVisibilityChange,
+    });
+
+    act(() => tableMocks.options.onColumnVisibilityChange({ detail: false }));
+
+    expect(onColumnVisibilityChange).toHaveBeenCalledWith({
+      'mrt-row-actions': false,
+      detail: false,
+    });
+  });
+
+  it('forwards a controlled reset of all visibility keys as visible', () => {
+    const onColumnVisibilityChange = vi.fn();
+    renderTable({
+      state: { columnVisibility: { detail: false } },
+      onColumnVisibilityChange,
+    });
+
+    act(() => tableMocks.options.onColumnVisibilityChange(() => ({})));
+
+    const updater = onColumnVisibilityChange.mock.calls.at(-1)![0];
+    expect(updater({ detail: false })).toEqual({ '0': true, detail: true });
+  });
+
+  it('uses updated caller visibility over initial visibility with a change callback', () => {
+    const onColumnVisibilityChange = vi.fn();
+    const props = {
+      columns: [{ accessorKey: 'selected', header: 'Selection' }],
+      data: [{ selected: false }],
+      initialState: { columnVisibility: { detail: true } },
+      onColumnVisibilityChange,
+    };
+    const { rerender } = renderTable({
+      ...props,
+      state: { columnVisibility: { detail: false } },
+    });
+    expect(tableMocks.options.state.columnVisibility.detail).toBe(false);
+
+    rerender(
+      <ThemeProvider theme={theme}>
+        <Table {...props} state={{ columnVisibility: { detail: true } }} />
+      </ThemeProvider>
+    );
+    expect(tableMocks.options.state.columnVisibility.detail).toBe(true);
+  });
+
+  it('treats caller visibility as the complete map with a change callback', () => {
+    const props = {
+      columns: [{ accessorKey: 'selected', header: 'Selection' }],
+      data: [{ selected: false }],
+      initialState: { columnVisibility: { detail: false } },
+      onColumnVisibilityChange: vi.fn(),
+    };
+    const { rerender } = renderTable({
+      ...props,
+      state: { columnVisibility: { detail: false } },
+    });
+    expect(tableMocks.options.state.columnVisibility).toEqual({ detail: false });
+
+    rerender(
+      <ThemeProvider theme={theme}>
+        <Table {...props} state={{ columnVisibility: {} }} />
+      </ThemeProvider>
+    );
+    expect(tableMocks.options.state.columnVisibility).toEqual({});
+
+    rerender(
+      <ThemeProvider theme={theme}>
+        <Table {...props} />
+      </ThemeProvider>
+    );
+    expect(tableMocks.options.state.columnVisibility).toEqual({ detail: false });
   });
 
   it('hides the top toolbar when disabled', () => {
@@ -294,6 +499,176 @@ describe('Table toolbar and selection props', () => {
 
     expect(tableMocks.setRowSelection).toHaveBeenCalledTimes(2);
   });
+});
+
+describe('Table cell memoization', () => {
+  it('re-renders cells when their row changes but not when only the renderer is rebuilt', () => {
+    const row = { selected: false };
+    // Callers such as resource lists pass inline columns, rebuilding renderers on every render.
+    const renderWith = (data: TestRow[]) => (
+      <ThemeProvider theme={theme}>
+        <Table
+          columns={[{ accessorKey: 'selected', header: 'Selection', Cell: () => null }]}
+          data={data}
+        />
+      </ThemeProvider>
+    );
+    const { rerender } = render(renderWith([row]));
+    const renders = tableMocks.bodyCellRenders;
+
+    rerender(renderWith([row]));
+    expect(tableMocks.bodyCellRenders).toBe(renders);
+
+    rerender(renderWith([{ ...row }]));
+    expect(tableMocks.bodyCellRenders).toBe(renders + 1);
+  });
+});
+
+describe('Table responsive visibility and horizontal scrolling', () => {
+  const columns = [
+    { id: 'selection', accessorKey: 'selected', header: 'Selection' },
+    { id: 'name', accessorKey: 'name', header: 'Name' },
+    { id: 'detail', accessorKey: 'detail', header: 'Detail' },
+  ];
+  let resize: (width: number) => void;
+
+  beforeEach(() => {
+    vi.spyOn(HTMLElement.prototype, 'clientWidth', 'get').mockReturnValue(150);
+    vi.stubGlobal(
+      'ResizeObserver',
+      class {
+        constructor(callback: ResizeObserverCallback) {
+          resize = width => callback([{ contentRect: { width } } as ResizeObserverEntry], this);
+        }
+        observe() {}
+        unobserve() {}
+        disconnect() {}
+      }
+    );
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  it('keeps normal responsive hiding and the existing table structure', () => {
+    renderTable({ columns });
+    expect(tableMocks.options.state.columnVisibility).toEqual({ name: false, detail: false });
+    const table = screen.getByRole('table');
+    expect(table).not.toHaveAttribute('tabindex');
+    expect(getComputedStyle(table).gridTemplateColumns).toBe('1fr');
+    expect(screen.getByTestId('top-toolbar').parentElement).toBe(table.parentElement);
+    expect(screen.getByTestId('bottom-toolbar').parentElement).toBe(table.parentElement);
+  });
+
+  it('preserves a local show/hide choice while resizing without remounting or losing focus', () => {
+    renderTable({ columns });
+    const table = screen.getByRole('table');
+    const checkbox = screen.getByRole('checkbox');
+    checkbox.focus();
+    act(() => tableMocks.options.onColumnVisibilityChange({ name: true, detail: false }));
+    expect(tableMocks.options.state.columnVisibility).toEqual({ name: true, detail: false });
+    expect(table).toHaveAttribute('tabindex', '0');
+    expect(getComputedStyle(table).gridTemplateColumns).toBe(
+      'minmax(100px, 1fr) minmax(100px, 1fr)'
+    );
+    expect(checkbox).toHaveFocus();
+
+    act(() => resize(600));
+    expect(tableMocks.options.state.columnVisibility).toEqual({ name: true, detail: false });
+    expect(table).not.toHaveAttribute('tabindex');
+    expect(getComputedStyle(table).gridTemplateColumns).toBe('1fr 1fr');
+    act(() => resize(150));
+    expect(screen.getByRole('table')).toBe(table);
+    expect(screen.getByRole('checkbox')).toBe(checkbox);
+    expect(checkbox).toHaveFocus();
+
+    act(() => tableMocks.options.onColumnVisibilityChange({ name: false, detail: false }));
+    expect(tableMocks.options.state.columnVisibility.name).toBe(false);
+    expect(table).not.toHaveAttribute('tabindex');
+    act(() => resize(600));
+    expect(tableMocks.options.state.columnVisibility.name).toBe(false);
+  });
+
+  it('honors initial visibility and excludes hidden columns from the width budget', () => {
+    const columnVisibility = { selection: false, name: false, detail: true };
+    renderTable({ columns, initialState: { columnVisibility } });
+    expect(tableMocks.options.state.columnVisibility).toEqual(columnVisibility);
+    expect(screen.getByRole('table')).not.toHaveAttribute('tabindex');
+  });
+
+  it('keeps the Node column after the user explicitly shows it', () => {
+    renderTable({
+      columns: [
+        { id: 'selection', accessorKey: 'selected', header: 'Selection' },
+        { id: 'status', accessorKey: 'status', header: 'Status' },
+        { id: 'node', accessorKey: 'node', header: 'Node' },
+        { id: 'ip', accessorKey: 'ip', header: 'IP' },
+      ],
+    });
+
+    act(() =>
+      tableMocks.options.onColumnVisibilityChange({
+        status: false,
+        node: true,
+        ip: false,
+      })
+    );
+
+    expect(tableMocks.options.state.columnVisibility).toMatchObject({
+      status: false,
+      node: true,
+      ip: false,
+    });
+    expect(screen.getByRole('table')).toHaveAttribute('tabindex', '0');
+  });
+
+  it('keeps caller control authoritative, including a replacement empty map', () => {
+    const onColumnVisibilityChange = vi.fn();
+    const props = { columns, data: [{ selected: false }], onColumnVisibilityChange };
+    const { rerender } = renderTable({ ...props, state: { columnVisibility: { name: true } } });
+    expect(tableMocks.options.state.columnVisibility.name).toBe(true);
+    act(() => tableMocks.options.onColumnVisibilityChange({ name: false }));
+    expect(onColumnVisibilityChange).toHaveBeenCalledWith({ name: false });
+    expect(tableMocks.options.state.columnVisibility.name).toBe(true);
+    rerender(
+      <ThemeProvider theme={theme}>
+        <Table {...props} state={{ columnVisibility: {} }} />
+      </ThemeProvider>
+    );
+    expect(tableMocks.options.state.columnVisibility).toEqual({ name: false, detail: false });
+    expect(screen.getByRole('table')).not.toHaveAttribute('tabindex');
+  });
+
+  it.each([
+    [undefined, 'minmax(100px, 1fr)'],
+    [2, 'minmax(100px, 2fr)'],
+    ['1.5fr', 'minmax(100px, 1.5fr)'],
+    ['auto', 'minmax(100px, auto)'],
+    ['min-content', 'minmax(100px, min-content)'],
+    ['minmax(120px, 2fr)', 'minmax(120px, 2fr)'],
+  ])(
+    'provides real minimum tracks for %s without replacing explicit CSS sizing',
+    (gridTemplate, expected) => {
+      renderTable({
+        columns: columns.slice(0, 2).map(column => ({ ...column, gridTemplate })),
+        enableRowActions: true,
+        enableRowSelection: true,
+      });
+      act(() => tableMocks.options.onColumnVisibilityChange({ selection: true, name: true }));
+      const table = screen.getByRole('table');
+      expect(table).toHaveAttribute('tabindex', '0');
+      expect(getComputedStyle(table).overflowX).toBe('auto');
+      expect(getComputedStyle(table).gridTemplateColumns).toBe(
+        `44px ${expected} ${expected} minmax(52px, 0.05fr)`
+      );
+      expect(table).not.toContainElement(screen.getByTestId('top-toolbar'));
+      expect(table).not.toContainElement(screen.getByTestId('bottom-toolbar'));
+      table.focus();
+      expect(table).toHaveFocus();
+    }
+  );
 });
 
 describe('Table states and options', () => {
@@ -395,6 +770,21 @@ describe('Table states and options', () => {
     expect(screen.getByTestId('fullscreen-toggle')).toBeVisible();
   });
 
+  it('renders additional actions beside the standard toolbar controls', () => {
+    const renderAdditionalToolbarActions = vi.fn(() => <button>Group by label</button>);
+    renderTable({ renderAdditionalToolbarActions });
+    const table = toolbarTable();
+    const toolbar = tableMocks.options.renderToolbarInternalActions({ table });
+
+    render(<ThemeProvider theme={theme}>{toolbar}</ThemeProvider>);
+
+    expect(screen.getByTestId('search-toggle')).toBeVisible();
+    expect(screen.getByTestId('filters-toggle')).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Group by label' })).toBeVisible();
+    expect(screen.getByTestId('column-visibility')).toBeVisible();
+    expect(renderAdditionalToolbarActions).toHaveBeenCalledWith({ table });
+  });
+
   it('provides an empty-results fallback to Material React Table', () => {
     renderTable();
 
@@ -472,20 +862,85 @@ describe('Table states and options', () => {
     clientWidth.mockRestore();
   });
 
-  it('hides and restores the actions column with data-column visibility', () => {
-    tableMocks.columnVisibility = { '0': false };
-    const hiddenResult = renderTable({
-      columns: [{ accessorKey: 'selected', header: 'Selection' }],
+  it('does not responsively hide columns that disable hiding', () => {
+    const clientWidth = vi.spyOn(HTMLElement.prototype, 'clientWidth', 'get').mockReturnValue(150);
+
+    renderTable({
+      columns: [
+        { id: 'selected', accessorKey: 'selected', header: 'Selection' },
+        {
+          id: 'name',
+          accessorKey: 'name',
+          header: 'Name',
+          enableHiding: false,
+          responsivePriority: -1,
+        },
+        { id: 'status', header: 'Status' },
+      ],
     });
 
+    expect(tableMocks.options.state.columnVisibility).toEqual({ status: false });
+
+    clientWidth.mockRestore();
+  });
+
+  it('does not keep restoring the actions column while responsive layout hides it', () => {
+    const clientWidth = vi.spyOn(HTMLElement.prototype, 'clientWidth', 'get').mockReturnValue(150);
+    tableMocks.columnVisibility = { actions: false };
+
+    renderTable({
+      columns: [
+        { id: 'name', accessorKey: 'name', header: 'Name' },
+        { id: 'actions', header: 'Actions' },
+      ],
+    });
+
+    expect(tableMocks.options.state.columnVisibility.actions).toBe(false);
     expect(tableMocks.setColumnVisibility).toHaveBeenCalledOnce();
+
+    clientWidth.mockRestore();
+  });
+
+  it('honors explicit visibility for locked columns over internal visibility', () => {
+    renderTable({
+      columns: [
+        { id: 'name', header: 'Name' },
+        { id: 'labels', header: 'Labels', enableHiding: false },
+        { id: 'group', header: 'Group', enableHiding: false },
+        { id: 'status', header: 'Status' },
+      ],
+      initialState: { columnVisibility: { labels: false, group: true, status: false } },
+      state: { columnVisibility: { labels: true, group: false, status: true } },
+    });
+
+    expect(tableMocks.options.state.columnVisibility).toEqual({
+      labels: true,
+      group: false,
+      status: false,
+    });
+  });
+
+  it('hides and restores the actions column with data-column visibility', () => {
+    const columns: TableProps<TestRow>['columns'] = [
+      { id: 'selected', accessorKey: 'selected', header: 'Selection' },
+    ];
+
+    const hiddenResult = renderTable({
+      columns,
+      enableRowActions: true,
+      state: { columnVisibility: { selected: false } },
+    });
+
+    expect(tableMocks.options.state.columnVisibility['mrt-row-actions']).toBe(false);
     hiddenResult.unmount();
 
-    tableMocks.setColumnVisibility.mockClear();
-    tableMocks.columnVisibility = { '0': true, actions: false };
-    renderTable({ columns: [{ accessorKey: 'selected', header: 'Selection' }] });
+    renderTable({
+      columns,
+      enableRowActions: true,
+      state: { columnVisibility: { selected: true } },
+    });
 
-    expect(tableMocks.setColumnVisibility).toHaveBeenCalledOnce();
+    expect(tableMocks.options.state.columnVisibility['mrt-row-actions']).not.toBe(false);
   });
 });
 
@@ -648,6 +1103,98 @@ describe('Table select filter faceted values', () => {
     expect(values.has('rare')).toBe(true);
     // The least common unselected value makes room for it, the cap itself holds.
     expect(values.size).toBe(1000);
+  });
+
+  it.each([
+    ['below the cap', 3],
+    ['past the cap', 1001],
+  ])('keeps offering a selected value a refresh took out of the rows, %s', (_description, size) => {
+    // MRT reads the chip label of a selected value back from these options, so a value
+    // that left the data has to stay among them while it is filtered for.
+    const rows = Array.from({ length: size }, (_, index) => ({ status: `s${index}` }));
+    renderTable({ columns: [statusColumn('multi-select')], data: rows as any });
+
+    const columnDef = tableMocks.options.columns[0];
+    const column = {
+      ...makeFacetedColumn(columnDef, rows),
+      getFilterValue: () => ['gone'],
+    };
+    const values = tableMocks.options.getFacetedUniqueValues(makeFacetedTable(column), 'status')();
+
+    expect(values.get('gone')).toBe(0);
+    expect(values.size).toBe(Math.min(size + 1, 1000));
+  });
+
+  it('does not call a list shortened that only gained an absent selection', () => {
+    const rows = Array.from({ length: 999 }, (_, index) => ({ status: `s${index}` }));
+    renderTable({ columns: [statusColumn('multi-select')], data: rows as any });
+
+    const { column, table } = makeFilterColumn(rows);
+    column.getFilterValue = () => ['gone'];
+    const props = tableMocks.options.muiFilterTextFieldProps({ column, table });
+
+    expect(column.getFacetedUniqueValues().size).toBe(1000);
+    expect(props.helperText).toBeUndefined();
+  });
+
+  it('serves the same map on every render while an absent selection stands', () => {
+    // MRT memoizes the dropdown on the identity of this map.
+    const rows = Array.from({ length: 3 }, (_, index) => ({ status: `s${index}` }));
+    renderTable({ columns: [statusColumn('multi-select')], data: rows as any });
+
+    const { column, table } = makeFilterColumn(rows);
+    column.getFilterValue = () => ['gone'];
+
+    const first = tableMocks.options.getFacetedUniqueValues(table, 'status')();
+    expect(first.get('gone')).toBe(0);
+    expect(tableMocks.options.getFacetedUniqueValues(table, 'status')()).toBe(first);
+  });
+
+  it('does not offer the free text of an autocomplete filter as a value', () => {
+    // The autocomplete shows its own input rather than an option's label, and what it is
+    // filtered by is whatever was typed.
+    const rows = Array.from({ length: 3 }, (_, index) => ({ status: `s${index}` }));
+    renderTable({ columns: [statusColumn('autocomplete')], data: rows as any });
+
+    const { column, table } = makeFilterColumn(rows);
+    column.getFilterValue = () => 's';
+
+    expect([...tableMocks.options.getFacetedUniqueValues(table, 'status')().keys()]).toEqual([
+      's0',
+      's1',
+      's2',
+    ]);
+  });
+
+  it('builds a new view when an autocomplete column turns into a dropdown', () => {
+    const rows = Array.from({ length: 1001 }, (_, index) => ({ status: `s${index}` }));
+    renderTable({ columns: [statusColumn('autocomplete')], data: rows as any });
+
+    const { column, table } = makeFilterColumn(rows);
+    column.getFilterValue = () => 'gone';
+    expect(tableMocks.options.getFacetedUniqueValues(table, 'status')().has('gone')).toBe(false);
+    // Same row model, so the cached walk is reused, but not the view built for the old variant.
+    column.columnDef = { ...column.columnDef, filterVariant: 'multi-select' };
+    column.getFilterValue = () => ['gone'];
+
+    expect(tableMocks.options.getFacetedUniqueValues(table, 'status')().get('gone')).toBe(0);
+  });
+
+  it('builds a new view when the filter changes to a value that only reads the same', () => {
+    // A non-string filter value cannot be offered, its string twin can. Both must not share
+    // one cached view.
+    const rows = Array.from({ length: 1001 }, (_, index) => ({ status: `s${index}` }));
+    renderTable({ columns: [statusColumn('multi-select')], data: rows as any });
+
+    const { column, table } = makeFilterColumn(rows);
+    column.getFilterValue = () => [5];
+    const forNumber = tableMocks.options.getFacetedUniqueValues(table, 'status')();
+    // MRT sorts the options with localeCompare, which a number would throw on.
+    expect([...forNumber.keys()].every(value => typeof value === 'string')).toBe(true);
+    expect(forNumber.has('5')).toBe(false);
+    column.getFilterValue = () => ['5'];
+
+    expect(tableMocks.options.getFacetedUniqueValues(table, 'status')().get('5')).toBe(0);
   });
 
   it('walks again when the filter moved to a value the cached set does not carry', () => {

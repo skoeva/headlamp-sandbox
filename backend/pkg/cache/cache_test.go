@@ -18,6 +18,7 @@ package cache_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -79,6 +80,37 @@ func TestCache(t *testing.T) {
 	testCache(ch, t)
 }
 
+func TestCacheConditionalUpdate(t *testing.T) {
+	ch := cache.New[string]()
+	ctx := t.Context()
+	matches := func(value string) bool { return value == "original" }
+	require.ErrorIs(t, ch.UpdateIf(ctx, "key", "updated", matches), cache.ErrNotFound)
+	require.NoError(t, ch.Set(ctx, "key", "original"))
+	require.NoError(t, ch.UpdateIf(ctx, "key", "updated", matches))
+	require.Error(t, ch.UpdateIf(ctx, "key", "stale", matches))
+	value, err := ch.Get(ctx, "key")
+	require.NoError(t, err)
+	require.Equal(t, "updated", value)
+	require.NoError(t, ch.Delete(ctx, "key"))
+	require.ErrorIs(t, ch.UpdateIf(ctx, "key", "stale", matches), cache.ErrNotFound)
+}
+
+func TestCacheConditionalUpdatePreservesExpiry(t *testing.T) {
+	ch := cache.New[string]()
+	ctx := t.Context()
+	require.NoError(t, ch.SetWithTTL(ctx, "key", "original", time.Second))
+	require.NoError(t, ch.UpdateIf(ctx, "key", "updated", func(value string) bool {
+		return value == "original"
+	}))
+	require.Eventually(t, func() bool {
+		_, err := ch.Get(ctx, "key")
+		return errors.Is(err, cache.ErrNotFound)
+	}, 3*time.Second, 10*time.Millisecond)
+	require.ErrorIs(t, ch.UpdateIf(ctx, "key", "stale", func(string) bool {
+		return true
+	}), cache.ErrNotFound)
+}
+
 func TestCacheGetAll(t *testing.T) {
 	// create cache
 	ch := cache.New[interface{}]()
@@ -117,4 +149,65 @@ func TestCacheClose(t *testing.T) {
 	// verify that double closing does not panic
 	err = ch.Close()
 	assert.NoError(t, err)
+}
+
+func TestUpdateTTL(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("expired key returns ErrNotFound and is not refreshed", func(t *testing.T) {
+		ch := cache.New[string]()
+
+		t.Cleanup(func() { _ = ch.Close() })
+
+		require.NoError(t, ch.SetWithTTL(ctx, "k", "v", 20*time.Millisecond))
+		time.Sleep(40 * time.Millisecond)
+
+		_, err := ch.Get(ctx, "k")
+		assert.ErrorIs(t, err, cache.ErrNotFound)
+
+		err = ch.UpdateTTL(ctx, "k", 5*time.Second)
+		assert.ErrorIs(t, err, cache.ErrNotFound)
+
+		_, err = ch.Get(ctx, "k")
+		assert.ErrorIs(t, err, cache.ErrNotFound)
+	})
+
+	t.Run("missing key returns ErrNotFound", func(t *testing.T) {
+		ch := cache.New[string]()
+
+		t.Cleanup(func() { _ = ch.Close() })
+
+		err := ch.UpdateTTL(ctx, "missing", time.Second)
+		assert.ErrorIs(t, err, cache.ErrNotFound)
+	})
+
+	t.Run("live key TTL is extended", func(t *testing.T) {
+		ch := cache.New[string]()
+
+		t.Cleanup(func() { _ = ch.Close() })
+
+		require.NoError(t, ch.SetWithTTL(ctx, "k", "v", 80*time.Millisecond))
+		require.NoError(t, ch.UpdateTTL(ctx, "k", 2*time.Second))
+
+		time.Sleep(150 * time.Millisecond)
+
+		value, err := ch.Get(ctx, "k")
+		assert.NoError(t, err)
+		assert.Equal(t, "v", value)
+	})
+
+	t.Run("zero TTL clears expiry like SetWithTTL", func(t *testing.T) {
+		ch := cache.New[string]()
+
+		t.Cleanup(func() { _ = ch.Close() })
+
+		require.NoError(t, ch.SetWithTTL(ctx, "k", "v", 50*time.Millisecond))
+		require.NoError(t, ch.UpdateTTL(ctx, "k", 0))
+
+		time.Sleep(80 * time.Millisecond)
+
+		value, err := ch.Get(ctx, "k")
+		assert.NoError(t, err)
+		assert.Equal(t, "v", value)
+	})
 }

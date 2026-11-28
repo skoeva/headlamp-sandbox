@@ -96,7 +96,17 @@ func NewOIDCTokenRefreshMiddleware(config OIDCTokenRefreshConfig) func(http.Hand
 				return
 			}
 
-			cluster, token := ParseClusterAndToken(r)
+			if headers, supplied := r.Header["Authorization"]; supplied &&
+				(len(headers) != 1 || BearerTokenValue(headers[0]) == "") {
+				status = "invalid_credentials"
+
+				logger.Log(logger.LevelWarn, nil, nil, "rejecting invalid supplied authorization before OIDC refresh")
+				http.Error(w, "invalid supplied authorization", http.StatusUnauthorized)
+
+				return
+			}
+
+			cluster, token := ParseClusterAndTokenWithBaseURL(r, config.BaseURL)
 			if config.shouldBypassOIDCRefresh(cluster, token, w, r, span, &status, next) {
 				return
 			}
@@ -175,7 +185,9 @@ func (c *OIDCTokenRefreshConfig) shouldSkipOIDCRefresh(
 	w http.ResponseWriter, r *http.Request, span trace.Span,
 	status *string, next http.Handler,
 ) bool {
-	if !strings.HasPrefix(r.URL.String(), "/clusters/") {
+	// Use URL.Path rather than URL.String() so query parameters do not affect
+	// whether this is a cluster request.
+	if !strings.HasPrefix(StripBaseURL(r.URL.Path, c.BaseURL), "/clusters/") {
 		c.TelemetryHandler.RecordEvent(span, "Not a cluster request, skipping OIDC refresh")
 
 		*status = "skipped"

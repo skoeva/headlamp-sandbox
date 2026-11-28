@@ -16,11 +16,11 @@
 
 import React from 'react';
 import { useErrorState } from '../util';
-import { useConnectApi } from '.';
+import { useConnectApi } from './api/v1/hooks';
 import { metrics } from './api/v1/metricsApi';
 import type { ApiError } from './api/v2/ApiError';
 import { KubeNodeSummaryStats, nodeSummaryStats } from './api/v2/nodeSummaryApi';
-import type { KubeCondition, KubeMetrics } from './cluster';
+import type { KubeMetrics, NodeCondition } from './cluster';
 import type { KubeObjectInterface } from './KubeObject';
 import { KubeObject } from './KubeObject';
 import { NODE_POOL_LABEL_KEYS } from './nodeConstants';
@@ -37,9 +37,7 @@ export interface KubeNode extends KubeObjectInterface {
      */
     allocatable?: { [key: string]: string };
     capacity?: { [key: string]: string };
-    conditions?: (Omit<KubeCondition, 'lastProbeTime' | 'lastUpdateTime'> & {
-      lastHeartbeatTime: string;
-    })[];
+    conditions?: NodeCondition[];
     nodeInfo?: {
       architecture: string;
       bootID: string;
@@ -93,9 +91,9 @@ class Node extends KubeObject<KubeNode> {
     }
 
     // eslint-disable-next-line react-hooks/rules-of-hooks
-    useConnectApi(
-      metrics.bind(null, '/apis/metrics.k8s.io/v1beta1/nodes', setMetrics, setError, cluster)
-    );
+    useConnectApi([
+      metrics.bind(null, '/apis/metrics.k8s.io/v1beta1/nodes', setMetrics, setError, cluster),
+    ]);
 
     return [nodeMetrics, error];
   }
@@ -118,7 +116,7 @@ class Node extends KubeObject<KubeNode> {
     }
 
     // eslint-disable-next-line react-hooks/rules-of-hooks
-    useConnectApi(nodeSummaryStats.bind(null, nodeName || '', setStats, setError, cluster));
+    useConnectApi([nodeSummaryStats.bind(null, nodeName || '', setStats, setError, cluster)]);
 
     return [summaryStats, error];
   }
@@ -146,7 +144,7 @@ class Node extends KubeObject<KubeNode> {
 
   /**
    * Returns the node pool name from well-known cloud provider labels.
-   * Supports GKE, AKS, EKS, kOps, and Cluster API.
+   * Supports GKE, AKS, EKS, kOps, Cluster API, and Karpenter.
    */
   getNodePool(): string {
     const labels = this.metadata.labels ?? {};

@@ -38,6 +38,10 @@ export const initialState: FilterState = {
  * @param item - The item to filter.
  * @param filter - The filter state.
  * @param matchCriteria - The JSONPath criteria to match.
+ * @param ignoreNamespaceFilter - When true, skips matching the item's namespace against
+ *                                 filter.namespaces. Used by views that are already scoped
+ *                                 to a specific namespace (or are cluster-scoped) so a stale
+ *                                 global namespace selection doesn't hide their rows.
  *
  * @returns True if the item matches the filter, false otherwise.
  */
@@ -45,11 +49,12 @@ export function filterResource(
   item: KubeObjectInterface | KubeEvent,
   filter: FilterState,
   search?: string,
-  matchCriteria?: string[]
+  matchCriteria?: string[],
+  ignoreNamespaceFilter?: boolean
 ) {
   let matches: boolean = true;
 
-  if (item.metadata.namespace && filter.namespaces.size > 0) {
+  if (!ignoreNamespaceFilter && item.metadata.namespace && filter.namespaces.size > 0) {
     matches = filter.namespaces.has(item.metadata.namespace);
   }
 
@@ -63,8 +68,10 @@ export function filterResource(
       item.metadata.uid?.toLowerCase() ?? '',
       item.metadata.namespace ? item.metadata.namespace.toLowerCase() : '',
       item.metadata.name?.toLowerCase() ?? '',
-      ...Object.keys(item.metadata.labels || {}).map(item => item.toLowerCase()),
-      ...Object.values(item.metadata.labels || {}).map(item => item.toLowerCase()),
+      ...Object.keys(item.metadata.labels || {}).map(key => String(key).toLowerCase()),
+      ...Object.values(item.metadata.labels || {})
+        .filter(val => val !== null && val !== undefined)
+        .map(val => String(val).toLowerCase()),
     ];
 
     matches = !!usedMatchCriteria.find(item => item.includes(filterString));

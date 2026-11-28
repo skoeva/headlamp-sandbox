@@ -272,7 +272,7 @@ describe('LogsButton', () => {
         <LogsButton item={new Deployment(deploymentData as any)} />
       </TestContext>
     );
-    expect(screen.getByLabelText('translation|Show logs')).toBeInTheDocument();
+    expect(screen.getByLabelText('Show logs')).toBeInTheDocument();
   });
 
   it('renders the logs button for a StatefulSet', () => {
@@ -281,7 +281,7 @@ describe('LogsButton', () => {
         <LogsButton item={new StatefulSet(statefulSetData as any)} />
       </TestContext>
     );
-    expect(screen.getByLabelText('translation|Show logs')).toBeInTheDocument();
+    expect(screen.getByLabelText('Show logs')).toBeInTheDocument();
   });
 
   it('does not render the logs button without a loggable workload', () => {
@@ -291,7 +291,7 @@ describe('LogsButton', () => {
       </TestContext>
     );
 
-    expect(screen.queryByLabelText('translation|Show logs')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Show logs')).not.toBeInTheDocument();
 
     const unknownItem = new MockKubeObject({ kind: 'Unknown', metadata: { name: 'unknown' } });
     rerender(
@@ -300,7 +300,7 @@ describe('LogsButton', () => {
       </TestContext>
     );
 
-    expect(screen.queryByLabelText('translation|Show logs')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Show logs')).not.toBeInTheDocument();
   });
 
   it('uses the Job spec.selector when launching logs for a Job', async () => {
@@ -312,7 +312,7 @@ describe('LogsButton', () => {
       </TestContext>
     );
 
-    const button = screen.getByLabelText('translation|Show logs');
+    const button = screen.getByLabelText('Show logs');
     expect(button).toBeInTheDocument();
     fireEvent.click(button);
 
@@ -354,7 +354,7 @@ describe('LogsButton', () => {
       </TestContext>
     );
 
-    const button = screen.getByLabelText('translation|Show logs');
+    const button = screen.getByLabelText('Show logs');
     fireEvent.click(button);
 
     const activityContent = mockActivityLaunch.mock.calls[0][0].content;
@@ -381,7 +381,7 @@ describe('LogsButton', () => {
         <LogsButton item={new Deployment(deploymentData as any)} />
       </TestContext>
     );
-    fireEvent.click(screen.getByLabelText('translation|Show logs'));
+    fireEvent.click(screen.getByLabelText('Show logs'));
     expect(mockActivityLaunch).toHaveBeenCalledWith(
       expect.objectContaining({
         id: 'logs-dep-123',
@@ -397,7 +397,7 @@ describe('LogsButton', () => {
         <LogsButton item={new Deployment(deploymentData as any)} />
       </TestContext>
     );
-    fireEvent.click(screen.getByLabelText('translation|Show logs'));
+    fireEvent.click(screen.getByLabelText('Show logs'));
     const activityContent = mockActivityLaunch.mock.calls[0][0].content;
     render(<TestContext>{activityContent}</TestContext>);
 
@@ -417,13 +417,13 @@ describe('LogsButton', () => {
         <LogsButton item={new Deployment(deploymentData as any)} />
       </TestContext>
     );
-    fireEvent.click(screen.getByLabelText('translation|Show logs'));
+    fireEvent.click(screen.getByLabelText('Show logs'));
     const activityContent = mockActivityLaunch.mock.calls[0][0].content;
     render(<TestContext>{activityContent}</TestContext>);
 
     await waitFor(() => {
       expect(mockEnqueueSnackbar).toHaveBeenCalledWith(
-        'translation|Failed to fetch pods: {{error}}',
+        expect.stringMatching(/Failed to fetch pods/i),
         expect.objectContaining({ variant: 'error' })
       );
     });
@@ -438,13 +438,13 @@ describe('LogsButton', () => {
         <LogsButton item={new Deployment(deploymentData as any)} />
       </TestContext>
     );
-    fireEvent.click(screen.getByLabelText('translation|Show logs'));
+    fireEvent.click(screen.getByLabelText('Show logs'));
     const activityContent = mockActivityLaunch.mock.calls[0][0].content;
     render(<TestContext>{activityContent}</TestContext>);
 
     await waitFor(() => {
       expect(mockEnqueueSnackbar).toHaveBeenCalledWith(
-        'translation|Failed to fetch pods: {{error}}',
+        expect.stringMatching(/Failed to fetch pods/i),
         expect.objectContaining({ variant: 'error' })
       );
     });
@@ -459,13 +459,13 @@ describe('LogsButton', () => {
         <LogsButton item={new Deployment(deploymentData as any)} />
       </TestContext>
     );
-    fireEvent.click(screen.getByLabelText('translation|Show logs'));
+    fireEvent.click(screen.getByLabelText('Show logs'));
     const activityContent = mockActivityLaunch.mock.calls[0][0].content;
     render(<TestContext>{activityContent}</TestContext>);
 
     await waitFor(() => {
       expect(mockEnqueueSnackbar).toHaveBeenCalledWith(
-        'translation|Failed to fetch pods: {{error}}',
+        expect.stringMatching(/Failed to fetch pods/i),
         expect.objectContaining({ variant: 'error' })
       );
     });
@@ -486,12 +486,12 @@ describe('LogsButton', () => {
         <LogsButton item={new Deployment(deploymentData as any)} />
       </TestContext>
     );
-    fireEvent.click(screen.getByLabelText('translation|Show logs'));
+    fireEvent.click(screen.getByLabelText('Show logs'));
     const activityContent = mockActivityLaunch.mock.calls[0][0].content;
     render(<TestContext>{activityContent}</TestContext>);
 
     await waitFor(() => expect(screen.getByTestId('mock-log-viewer')).toBeInTheDocument());
-    expect(document.querySelectorAll('.MuiSelect-select')[3]).toHaveTextContent('translation|All');
+    expect(document.querySelectorAll('.MuiSelect-select')[4]).toHaveTextContent('All');
   });
 
   it('restores valid severities from storage', async () => {
@@ -503,12 +503,12 @@ describe('LogsButton', () => {
         <LogsButton item={new Deployment(deploymentData as any)} />
       </TestContext>
     );
-    fireEvent.click(screen.getByLabelText('translation|Show logs'));
+    fireEvent.click(screen.getByLabelText('Show logs'));
     const activityContent = mockActivityLaunch.mock.calls[0][0].content;
     render(<TestContext>{activityContent}</TestContext>);
 
-    await waitFor(() => expect(document.querySelectorAll('.MuiSelect-select')[3]).toBeTruthy());
-    expect(document.querySelectorAll('.MuiSelect-select')[3]).toHaveTextContent('ERROR, INFO');
+    await waitFor(() => expect(document.querySelectorAll('.MuiSelect-select')[4]).toBeTruthy());
+    expect(document.querySelectorAll('.MuiSelect-select')[4]).toHaveTextContent('ERROR, INFO');
   });
 
   it('streams logs successfully', async () => {
@@ -529,7 +529,7 @@ describe('LogsButton', () => {
         <LogsButton item={new Deployment(deploymentData as any, 'test-cluster')} />
       </TestContext>
     );
-    fireEvent.click(screen.getByLabelText('translation|Show logs'));
+    fireEvent.click(screen.getByLabelText('Show logs'));
     const activityContent = mockActivityLaunch.mock.calls[0][0].content;
     render(<TestContext>{activityContent}</TestContext>);
 
@@ -561,7 +561,7 @@ describe('LogsButton', () => {
         <LogsButton item={new Deployment(deploymentData as any)} />
       </TestContext>
     );
-    fireEvent.click(screen.getByLabelText('translation|Show logs'));
+    fireEvent.click(screen.getByLabelText('Show logs'));
     const activityContent = mockActivityLaunch.mock.calls[0][0].content;
     const { unmount } = render(<TestContext>{activityContent}</TestContext>);
 
@@ -571,10 +571,15 @@ describe('LogsButton', () => {
     await waitFor(() => expect(onLogsCallback).toBeDefined());
 
     act(() => {
-      onLogsCallback({ logs: Array.from({ length: 1001 }, (_, index) => `line ${index}\n`) });
+      onLogsCallback({ logs: Array.from({ length: 2500 }, (_, index) => `line ${index}\n`) });
     });
     expect(mockXTermWrite).toHaveBeenCalledWith(expect.stringContaining('line 999'));
     expect(requestAnimationFrameSpy).toHaveBeenCalled();
+
+    // A batch larger than the chunk size has to be drained completely, even if the
+    // stream goes quiet right after it.
+    expect(mockXTermWrite).toHaveBeenCalledWith(expect.stringContaining('line 1000'));
+    expect(mockXTermWrite).toHaveBeenCalledWith(expect.stringContaining('line 2499'));
 
     mockXTermWrite.mockClear();
     unmount();
@@ -583,33 +588,73 @@ describe('LogsButton', () => {
     requestAnimationFrameSpy.mockRestore();
   });
 
-  it('clears the reconnect prompt when requested', async () => {
-    mockClusterFetch.mockResolvedValue({
-      json: async () => ({ items: [mockPodData] }),
-    });
+  it.each(['all pods', 'selected pod'])(
+    'restarts %s and clears the reconnect prompt',
+    async mode => {
+      mockClusterFetch.mockResolvedValue({
+        json: async () => ({ items: [mockPodData] }),
+      });
 
-    let onReconnectStop: (() => void) | undefined;
-    Pod.prototype.getLogs = vi.fn((...args: any[]) => {
-      onReconnectStop = args.at(-1)?.onReconnectStop;
-      return () => {};
-    }) as any;
+      let onReconnectStop: (() => void) | undefined;
+      const cancels: Array<ReturnType<typeof vi.fn>> = [];
+      const getLogs = vi.spyOn(Pod.prototype, 'getLogs').mockImplementation((...args) => {
+        if (args.length === 3) {
+          onReconnectStop = args[2].onReconnectStop;
+        }
+        const cancel = vi.fn();
+        cancels.push(cancel);
+        return cancel;
+      });
 
-    render(
-      <TestContext>
-        <LogsButton item={new Deployment(deploymentData as any)} />
-      </TestContext>
-    );
-    fireEvent.click(screen.getByLabelText('translation|Show logs'));
-    const activityContent = mockActivityLaunch.mock.calls[0][0].content;
-    render(<TestContext>{activityContent}</TestContext>);
+      render(
+        <TestContext>
+          <LogsButton item={new Deployment(deploymentData as any)} />
+        </TestContext>
+      );
+      fireEvent.click(screen.getByLabelText('Show logs'));
+      const activityContent = mockActivityLaunch.mock.calls[0][0].content;
+      render(<TestContext>{activityContent}</TestContext>);
 
-    await waitFor(() => expect(onReconnectStop).toBeDefined());
-    act(() => onReconnectStop?.());
-    fireEvent.click(await screen.findByRole('button', { name: 'Reconnect test stream' }));
+      await waitFor(() => expect(getLogs).toHaveBeenCalled());
+      if (mode === 'selected pod') {
+        const callsBefore = getLogs.mock.calls.length;
+        fireEvent.mouseDown(screen.getByRole('combobox', { name: 'Select Pod' }));
+        fireEvent.click(await screen.findByRole('option', { name: 'test-pod-1' }));
+        await waitFor(() => expect(getLogs).toHaveBeenCalledTimes(callsBefore + 1));
+      }
 
-    expect(mockXTermClear).toHaveBeenCalled();
-    expect(screen.queryByRole('button', { name: 'Reconnect test stream' })).not.toBeInTheDocument();
-  });
+      fireEvent.mouseDown(screen.getByRole('combobox', { name: 'Since' }));
+      fireEvent.click(await screen.findByRole('option', { name: 'Last 15 minutes' }));
+      await waitFor(() =>
+        expect(getLogs).toHaveBeenLastCalledWith(
+          'nginx',
+          expect.any(Function),
+          expect.objectContaining({ sinceSeconds: 900, follow: true })
+        )
+      );
+
+      const callsBeforeReconnect = getLogs.mock.calls.length;
+      const cancelPrevious = cancels[cancels.length - 1];
+      expect(cancelPrevious).not.toHaveBeenCalled();
+      mockXTermClear.mockClear();
+
+      act(() => onReconnectStop?.());
+      fireEvent.click(await screen.findByRole('button', { name: 'Reconnect test stream' }));
+
+      await waitFor(() => expect(getLogs).toHaveBeenCalledTimes(callsBeforeReconnect + 1));
+      expect(cancelPrevious).toHaveBeenCalledTimes(1);
+      expect(getLogs).toHaveBeenLastCalledWith(
+        'nginx',
+        expect.any(Function),
+        expect.objectContaining({ sinceSeconds: 900, follow: true })
+      );
+      expect(cancels[cancels.length - 1]).not.toHaveBeenCalled();
+      expect(mockXTermClear).toHaveBeenCalled();
+      expect(
+        screen.queryByRole('button', { name: 'Reconnect test stream' })
+      ).not.toBeInTheDocument();
+    }
+  );
 
   it('updates stream options for a restarted container', async () => {
     const restartedPod = {
@@ -636,17 +681,17 @@ describe('LogsButton', () => {
         <LogsButton item={new Deployment(deploymentData as any)} />
       </TestContext>
     );
-    fireEvent.click(screen.getByLabelText('translation|Show logs'));
+    fireEvent.click(screen.getByLabelText('Show logs'));
     const activityContent = mockActivityLaunch.mock.calls[0][0].content;
     render(<TestContext>{activityContent}</TestContext>);
 
     const previousSwitch = await screen.findByRole('checkbox', {
-      name: 'translation|Show previous',
+      name: 'Show previous',
     });
     expect(previousSwitch).toBeEnabled();
     fireEvent.click(previousSwitch);
-    fireEvent.click(screen.getByRole('checkbox', { name: 'translation|Timestamps' }));
-    fireEvent.click(screen.getByRole('checkbox', { name: 'translation|Follow' }));
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Timestamps' }));
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Follow' }));
 
     const selects = document.querySelectorAll('.MuiSelect-select');
     fireEvent.mouseDown(selects[2]);
@@ -666,6 +711,83 @@ describe('LogsButton', () => {
         })
       );
     });
+  });
+
+  it('refetches a selected pod with the selected Since window', async () => {
+    mockClusterFetch.mockResolvedValue({ json: async () => ({ items: [mockPodData] }) });
+    Pod.prototype.getLogs = vi.fn(() => () => {}) as any;
+
+    render(
+      <TestContext>
+        <LogsButton item={new Deployment(deploymentData as any)} />
+      </TestContext>
+    );
+    fireEvent.click(screen.getByLabelText('Show logs'));
+    const activityContent = mockActivityLaunch.mock.calls[0][0].content;
+    render(<TestContext>{activityContent}</TestContext>);
+
+    const getLogsMock = vi.mocked(Pod.prototype.getLogs);
+    await waitFor(() => expect(getLogsMock).toHaveBeenCalled());
+    getLogsMock.mockClear();
+
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: 'Select Pod' }));
+    fireEvent.click(await screen.findByRole('option', { name: 'test-pod-1' }));
+    await waitFor(() => {
+      expect(getLogsMock).toHaveBeenLastCalledWith(
+        'nginx',
+        expect.any(Function),
+        expect.objectContaining({ sinceSeconds: undefined })
+      );
+    });
+    getLogsMock.mockClear();
+
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: 'Since' }));
+    fireEvent.click(await screen.findByRole('option', { name: 'Last 15 minutes' }));
+
+    await waitFor(() => {
+      expect(getLogsMock).toHaveBeenLastCalledWith(
+        'nginx',
+        expect.any(Function),
+        expect.objectContaining({ sinceSeconds: 900, follow: true, showPrevious: false })
+      );
+    });
+  });
+
+  it('refetches the selected Since window when logs are populated and Follow is off', async () => {
+    mockClusterFetch.mockResolvedValue({ json: async () => ({ items: [mockPodData] }) });
+    Pod.prototype.getLogs = vi.fn((...args: any[]) => {
+      const onLogs = args.find(arg => typeof arg === 'function');
+      onLogs({ logs: ['log line 1\n'] });
+      return () => {};
+    }) as any;
+
+    render(
+      <TestContext>
+        <LogsButton item={new Deployment(deploymentData as any)} />
+      </TestContext>
+    );
+    fireEvent.click(screen.getByLabelText('Show logs'));
+    const activityContent = mockActivityLaunch.mock.calls[0][0].content;
+    render(<TestContext>{activityContent}</TestContext>);
+
+    await waitFor(() => {
+      expect(mockXTermWrite).toHaveBeenCalledWith(expect.stringContaining('log line 1'));
+    });
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Follow' }));
+
+    // With Follow off and logs already loaded, the stream is paused and not refetched.
+    const callsBefore = vi.mocked(Pod.prototype.getLogs).mock.calls.length;
+    fireEvent.mouseDown(document.querySelectorAll('.MuiSelect-select')[3]);
+    fireEvent.click(await screen.findByText('Last 15 minutes'));
+
+    await waitFor(() => {
+      expect(Pod.prototype.getLogs).toHaveBeenLastCalledWith(
+        expect.any(String),
+        expect.any(Function),
+        expect.objectContaining({ sinceSeconds: 900, follow: false })
+      );
+    });
+    expect(vi.mocked(Pod.prototype.getLogs).mock.calls.length).toBeGreaterThan(callsBefore);
   });
 
   it('debounces processAllLogs and batches multiple pod updates', async () => {
@@ -694,7 +816,7 @@ describe('LogsButton', () => {
         <LogsButton item={new Deployment(deploymentData as any)} />
       </TestContext>
     );
-    fireEvent.click(screen.getByLabelText('translation|Show logs'));
+    fireEvent.click(screen.getByLabelText('Show logs'));
     const activityContent = mockActivityLaunch.mock.calls[0][0].content;
     render(<TestContext>{activityContent}</TestContext>);
 
@@ -745,7 +867,7 @@ describe('LogsButton', () => {
         <LogsButton item={new Deployment(deploymentData as any)} />
       </TestContext>
     );
-    fireEvent.click(screen.getByLabelText('translation|Show logs'));
+    fireEvent.click(screen.getByLabelText('Show logs'));
     const activityContent = mockActivityLaunch.mock.calls[0][0].content;
     const { unmount } = render(<TestContext>{activityContent}</TestContext>);
 
@@ -856,7 +978,7 @@ describe('LogsButton', () => {
       </TestContext>
     );
 
-    fireEvent.click(screen.getByLabelText('translation|Show logs'));
+    fireEvent.click(screen.getByLabelText('Show logs'));
     const activityContent = mockActivityLaunch.mock.calls[0][0].content;
     render(<TestContext>{activityContent}</TestContext>);
 
@@ -880,7 +1002,7 @@ describe('LogsButton', () => {
 
     // Now change severity filter by directly clicking the button
     const selects = document.querySelectorAll('.MuiSelect-select');
-    const severitySelect = selects[3];
+    const severitySelect = selects[4];
     fireEvent.mouseDown(severitySelect);
 
     await waitFor(() => {
@@ -906,6 +1028,77 @@ describe('LogsButton', () => {
     // Verify stream was not restarted
     expect(getLogsCallCount).toBe(1);
   });
+  // A severity change repaints the terminal from the logs kept in state. Only the entries
+  // already drained are on screen, so repainting the whole batch would let the frames that
+  // are still queued append their entries a second time.
+  it('does not duplicate the queued tail when the severity changes mid-drain', async () => {
+    const frames: FrameRequestCallback[] = [];
+    const requestAnimationFrameSpy = vi
+      .spyOn(window, 'requestAnimationFrame')
+      .mockImplementation(callback => {
+        frames.push(callback);
+        return frames.length;
+      });
+    mockClusterFetch.mockResolvedValue({
+      json: async () => ({ items: [mockPodData] }),
+    });
+
+    let onLogsCallback: any;
+    Pod.prototype.getLogs = vi.fn((...args: any[]) => {
+      onLogsCallback = args.find(arg => typeof arg === 'function');
+      return () => {};
+    }) as any;
+
+    render(
+      <TestContext>
+        <LogsButton item={new Deployment(deploymentData as any)} />
+      </TestContext>
+    );
+    fireEvent.click(screen.getByLabelText('Show logs'));
+    const activityContent = mockActivityLaunch.mock.calls[0][0].content;
+    render(<TestContext>{activityContent}</TestContext>);
+
+    // The drain only runs for a single selected pod; "All pods" repaints wholesale.
+    await waitFor(() => expect(document.querySelectorAll('.MuiSelect-select')[0]).toBeTruthy());
+    fireEvent.mouseDown(document.querySelectorAll('.MuiSelect-select')[0]);
+    fireEvent.click(await screen.findByText('test-pod-1'));
+    await waitFor(() => expect(onLogsCallback).toBeDefined());
+
+    // Two chunks worth of entries, so the second one is left queued on a frame.
+    const newLogs = Array.from({ length: 1500 }, (_, index) => `[ERROR] line ${index}\n`);
+    act(() => onLogsCallback({ logs: newLogs }));
+    expect(frames).toHaveLength(1);
+
+    // Repaint under a narrowed severity while that frame is still pending. Clicking INFO
+    // deselects it, so the ERROR entries above stay on screen.
+    mockXTermWrite.mockClear();
+    const severitySelect = document.querySelectorAll('.MuiSelect-select')[4];
+    fireEvent.mouseDown(severitySelect);
+    await waitFor(() => expect(document.querySelector('.MuiList-root')).toBeInTheDocument());
+    const infoOption = Array.from(document.querySelectorAll('.MuiMenuItem-root')).find(
+      el => el.textContent === 'INFO'
+    );
+    fireEvent.click(infoOption!);
+    fireEvent.keyDown(document.activeElement!, { key: 'Escape' });
+    await waitFor(() => expect(mockXTermClear).toHaveBeenCalled());
+
+    // The repaint owes the terminal only what had been drained, so the frame that is still
+    // queued can append the rest without any entry reaching the terminal twice.
+    const repainted = mockXTermWrite.mock.calls.map(call => call[0]).join('');
+    expect(repainted).toContain('line 999');
+    expect(repainted).not.toContain('line 1000');
+
+    act(() => frames[0](0));
+
+    const written = mockXTermWrite.mock.calls.map(call => call[0]).join('');
+    const timesWritten = (index: number) => written.split(`line ${index}\r\n`).length - 1;
+    expect(timesWritten(999)).toBe(1);
+    expect(timesWritten(1000)).toBe(1);
+    expect(timesWritten(1499)).toBe(1);
+
+    requestAnimationFrameSpy.mockRestore();
+  });
+
   it('broadcasts severity updates to other hook instances', async () => {
     const getLogsMock = vi.fn(() => {
       return () => {};
@@ -929,7 +1122,7 @@ describe('LogsButton', () => {
         <LogsButton item={new Deployment(deploymentData as any)} />
       </TestContext>
     );
-    const button = screen.getByRole('button', { name: 'translation|Show logs' });
+    const button = screen.getByRole('button', { name: 'Show logs' });
     fireEvent.click(button);
 
     const activityContent = mockActivityLaunch.mock.calls[0][0].content;
@@ -942,7 +1135,7 @@ describe('LogsButton', () => {
 
     // 4. Change severity filter directly in the UI
     const selects = document.querySelectorAll('.MuiSelect-select');
-    const severitySelect = selects[3];
+    const severitySelect = selects[4];
     fireEvent.mouseDown(severitySelect);
 
     await waitFor(() => {

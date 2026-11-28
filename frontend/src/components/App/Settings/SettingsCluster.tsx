@@ -15,6 +15,7 @@
  */
 
 import { Icon, InlineIcon } from '@iconify/react';
+import Alert from '@mui/material/Alert';
 import Box from '@mui/material/Box';
 import Button from '@mui/material/Button';
 import Chip from '@mui/material/Chip';
@@ -28,25 +29,31 @@ import { useTranslation } from 'react-i18next';
 import { useDispatch } from 'react-redux';
 import { useHistory, useLocation } from 'react-router-dom';
 import { sanitizeCssColor } from '../../../helpers/clusterAppearance';
+import { ClusterTags, getClusterTagIdentity, loadClusterTags } from '../../../helpers/clusterTags';
 import { isElectron } from '../../../helpers/isElectron';
 import { useCluster, useClustersConf } from '../../../lib/k8s';
 import { useAllowedNamespacesFromSelector } from '../../../lib/k8s/allowedNamespaces';
 import { deleteCluster } from '../../../lib/k8s/api/v1/clusterApi';
 import { setConfig } from '../../../redux/configSlice';
 import { HeadlampEventType, useEventCallback } from '../../../redux/headlampEventSlice';
+import { useTypedSelector } from '../../../redux/hooks';
+import { enqueueConfigOperation } from '../../../stateless/configOperationQueue';
 import ConfirmButton from '../../common/ConfirmButton';
 import Empty from '../../common/EmptyContent';
 import Link from '../../common/Link';
 import Loader from '../../common/Loader';
 import NameValueTable from '../../common/NameValueTable';
+import { labelMapsEqual } from '../../common/Resource/CreateResourceForm/CreateResourceForm';
 import SectionBox from '../../common/SectionBox';
 import { ClusterNameEditor } from './ClusterNameEditor';
 import ClusterSelector from './ClusterSelector';
+import { canSaveClusterTags, ClusterTagsEditor } from './ClusterTagsEditor';
 import ColorPicker from './ColorPicker';
 import IconPicker from './IconPicker';
 import NodeShellSettings from './NodeShellSettings';
 import PodDebugSettings from './PodDebugSettings';
 import { useClusterSettings } from './useClusterSettings';
+import { useClusterTagStorage } from './useClusterTagStorage';
 import { isValidNamespaceFormat } from './util';
 
 export default function SettingsCluster() {
@@ -57,6 +64,9 @@ export default function SettingsCluster() {
   const { t } = useTranslation(['translation']);
   const initialCluster = useCluster() || '';
   const [cluster, setCluster] = React.useState(initialCluster);
+  const statelessCluster = useTypedSelector(state => state.config.statelessClusters?.[cluster]);
+  const metadata = clusterConf?.[cluster]?.meta_data;
+  const canRename = !!statelessCluster || (metadata?.canRename ?? !!metadata?.origin?.kubeconfig);
 
   const [clusterSettings, setClusterSettings] = useClusterSettings(cluster);
 
@@ -84,9 +94,11 @@ export default function SettingsCluster() {
   }, [cluster]);
 
   const removeCluster = () => {
-    deleteCluster(cluster || '')
-      .then(config => {
-        dispatch(setConfig(config));
+    enqueueConfigOperation(async () => {
+      const config = await deleteCluster(cluster || '');
+      dispatch(setConfig(config));
+    })
+      .then(() => {
         history.push('/');
       })
       .catch((err: Error) => {
@@ -142,12 +154,38 @@ export default function SettingsCluster() {
   const [defaultNamespaceInput, setDefaultNamespaceInput] = React.useState(defaultNamespace);
   React.useEffect(() => {
     setDefaultNamespaceInput(defaultNamespace);
-  }, [defaultNamespace]);
+  }, [defaultNamespace, cluster]);
 
   const allowedNamespacesSelector = clusterSettings.allowedNamespacesSelector || '';
   React.useEffect(() => {
     setNamespacesSelectorInput(allowedNamespacesSelector);
   }, [allowedNamespacesSelector, cluster]);
+
+  React.useEffect(() => {
+    setNewAllowedNamespace('');
+  }, [cluster]);
+  const savedTags = useMemo(
+    () => loadClusterTags(cluster, clusterInfo, { tags: clusterSettings.tags }),
+    [cluster, clusterInfo, clusterSettings.tags]
+  );
+  const tagStorage = useClusterTagStorage(cluster, clusterInfo);
+  const tagIdentity = getClusterTagIdentity(cluster, clusterInfo);
+  const [tagsDraft, setTagsDraft] = React.useState<ClusterTags>(savedTags);
+  const [tagRowsValid, setTagRowsValid] = React.useState(true);
+  // Remounts the editor, so discarding also drops rows that aren't part of the draft,
+  // such as rows without a key.
+  const [tagsEditorRevision, setTagsEditorRevision] = React.useState(0);
+  const previousSavedTags = React.useRef({ identity: tagIdentity, tags: savedTags });
+  React.useEffect(() => {
+    if (
+      previousSavedTags.current.identity !== tagIdentity ||
+      !labelMapsEqual(previousSavedTags.current.tags, savedTags)
+    ) {
+      setTagsDraft(savedTags);
+      setTagsEditorRevision(revision => revision + 1);
+    }
+    previousSavedTags.current = { identity: tagIdentity, tags: savedTags };
+  }, [savedTags, tagIdentity]);
 
   // Resolve the configured selector (via Namespace.useList) and keep the cache in
   // sync. The resolution is keyed on the persisted selector, so it re-runs after
@@ -184,6 +222,9 @@ export default function SettingsCluster() {
   }
 
   function storeNewAllowedNamespace(namespace: string) {
+    if (!namespace || !isValidNamespaceFormat(namespace)) {
+      return;
+    }
     setNewAllowedNamespace('');
     setClusterSettings(settings => {
       const newSettings = { ...settings };
@@ -243,6 +284,7 @@ export default function SettingsCluster() {
   const allowedNamespaceLabelID = 'allowed-namespace-label';
   const allowedNamespacesSelectorLabelID = 'allowed-namespaces-selector-label';
   const appearanceLabelID = 'cluster-appearance-label';
+  const tagsLabelID = 'cluster-tags-label';
   const accentColorLabelID = 'accent-color-label';
   const clusterIconLabelID = 'cluster-icon-label';
   const colorButtonID = 'color-picker-button';
@@ -261,7 +303,7 @@ export default function SettingsCluster() {
             {t('translation|Go to cluster')}
           </Link>
         </Box>
-        {isElectron() && (
+        {isElectron() && canRename && (
           <ClusterNameEditor
             cluster={cluster}
             clusterConf={clusterConf}
@@ -366,6 +408,58 @@ export default function SettingsCluster() {
                 </Box>
               ),
             },
+            {
+              name: (
+                <Box>
+                  <Typography id={tagsLabelID}>{t('translation|Tags')}</Typography>
+                  <Typography variant="body2" color="textSecondary">
+                    {tagStorage.helpText}
+                  </Typography>
+                </Box>
+              ),
+              value: (
+                <Box role="group" aria-labelledby={tagsLabelID} sx={{ minWidth: 280 }}>
+                  <ClusterTagsEditor
+                    key={`${cluster}-${tagsEditorRevision}`}
+                    value={tagsDraft}
+                    onChange={setTagsDraft}
+                    onValidityChange={setTagRowsValid}
+                    disabled={tagStorage.saving}
+                  />
+                  {tagStorage.error && <Alert severity="error">{tagStorage.error}</Alert>}
+                  <Box display="flex" gap={1} sx={{ mt: 1 }}>
+                    <Button
+                      variant="contained"
+                      size="small"
+                      disabled={
+                        tagStorage.saving ||
+                        !tagRowsValid ||
+                        !canSaveClusterTags(savedTags, tagsDraft)
+                      }
+                      onClick={async () => {
+                        await tagStorage.save(tagsDraft);
+                      }}
+                    >
+                      {t('translation|Save tags')}
+                    </Button>
+                    <Button
+                      variant="outlined"
+                      size="small"
+                      color="secondary"
+                      disabled={
+                        tagStorage.saving || (tagRowsValid && labelMapsEqual(savedTags, tagsDraft))
+                      }
+                      onClick={() => {
+                        setTagsDraft(savedTags);
+                        setTagsEditorRevision(revision => revision + 1);
+                      }}
+                    >
+                      {t('translation|Discard changes')}
+                    </Button>
+                  </Box>
+                </Box>
+              ),
+            },
           ]}
         />
         <NameValueTable
@@ -442,7 +536,7 @@ export default function SettingsCluster() {
                           onClick={() => {
                             storeNewAllowedNamespace(newAllowedNamespace);
                           }}
-                          disabled={!newAllowedNamespace}
+                          disabled={!newAllowedNamespace || !isValidNewAllowedNamespace}
                           size="medium"
                           aria-label={t('translation|Add namespace')}
                         >
@@ -451,7 +545,10 @@ export default function SettingsCluster() {
                       ),
                       onKeyDown: event => {
                         if (event.key === 'Enter') {
-                          storeNewAllowedNamespace(newAllowedNamespace);
+                          event.preventDefault();
+                          if (newAllowedNamespace && isValidNewAllowedNamespace) {
+                            storeNewAllowedNamespace(newAllowedNamespace);
+                          }
                         }
                       },
                       autoComplete: 'off',

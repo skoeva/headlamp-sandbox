@@ -24,7 +24,9 @@ import Namespace from '../../lib/k8s/namespace';
 import { HeadlampEventType, useEventCallback } from '../../redux/headlampEventSlice';
 import { useTypedSelector } from '../../redux/hooks';
 import type { ProjectDefinition } from '../../redux/projectsSlice';
-import AllowedNamespacesSelectorGate from '../App/AllowedNamespacesSelectorGate';
+import AllowedNamespacesSelectorGate, {
+  AllowedNamespacesSelectorProvider,
+} from '../App/AllowedNamespacesSelectorGate';
 import { StatusLabel } from '../common';
 import Link from '../common/Link';
 import Table, { TableColumn } from '../common/Table/Table';
@@ -61,28 +63,33 @@ export const useProject = (name: string) => {
     [location.search]
   );
 
-  const { items: namespaces, isLoading } = Namespace.useList({
+  const {
+    items: namespaces,
+    isError,
+    isFetching,
+    isLoading,
+  } = Namespace.useList({
     clusters: clusters.map(c => c.name),
     labelSelector: PROJECT_ID_LABEL + '=' + name,
   });
 
-  return useMemo(
-    () => ({
+  return useMemo(() => {
+    const project = namespaces
+      ? findProject(groupNamespacesIntoProjects(namespaces, projectGrouping), name, projectKey) ?? {
+          id: name,
+          clusters: [],
+          namespaces: [],
+        }
+      : undefined;
+
+    return {
       isLoading,
-      project: namespaces
-        ? findProject(
-            groupNamespacesIntoProjects(namespaces, projectGrouping),
-            name,
-            projectKey
-          ) ?? {
-            id: name,
-            clusters: [],
-            namespaces: [],
-          }
-        : undefined,
-    }),
-    [isLoading, name, namespaces, projectGrouping, projectKey]
-  );
+      project:
+        project && (isError || isFetching || isLoading)
+          ? { ...project, namespaceDiscoveryComplete: false }
+          : project,
+    };
+  }, [isError, isFetching, isLoading, name, namespaces, projectGrouping, projectKey]);
 };
 
 function ProjectListContent() {
@@ -243,8 +250,10 @@ export default function ProjectList() {
   const clusters = Object.values(clusterConf ?? {}).map(cluster => cluster.name);
 
   return (
-    <AllowedNamespacesSelectorGate clusters={clusters}>
-      <ProjectListContent />
-    </AllowedNamespacesSelectorGate>
+    <AllowedNamespacesSelectorProvider clusters={clusters}>
+      <AllowedNamespacesSelectorGate>
+        <ProjectListContent />
+      </AllowedNamespacesSelectorGate>
+    </AllowedNamespacesSelectorProvider>
   );
 }

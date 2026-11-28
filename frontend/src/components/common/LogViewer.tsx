@@ -91,6 +91,8 @@ export function LogViewer(props: LogViewerProps) {
     // Required for FireFox
     document.body.appendChild(element);
     element.click();
+    document.body.removeChild(element);
+    URL.revokeObjectURL(element.href);
   }
 
   /** Reads back what's actually rendered in the terminal, so filtering/formatting applied by callers (e.g. severity filters) is preserved in the copy. Falls back to the raw logs if the terminal isn't available. */
@@ -304,7 +306,7 @@ export function LogViewer(props: LogViewerProps) {
         )}
         <div
           id="xterm-container"
-          ref={ref => setTerminalContainerRef(ref)}
+          ref={setTerminalContainerRef}
           style={{ flex: 1, display: 'flex', flexDirection: 'column-reverse' }}
         />
         <SearchPopover

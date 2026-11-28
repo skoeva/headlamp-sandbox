@@ -16,16 +16,201 @@
 
 // Registers the app's routes (via setDefaultRoutes) so createRouteURL below has routes to resolve.
 import '../router';
+import { configureStore } from '@reduxjs/toolkit';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { createElement, type ReactNode } from 'react';
+import { Provider } from 'react-redux';
 import { afterEach, beforeEach, vi } from 'vitest';
+import { useClusterTags } from '../../components/App/Home/useClusterTags';
+import { loadClusterTags, storeClusterTags } from '../../helpers/clusterTags';
+import configReducer, { setConfig, setStatelessConfig } from '../../redux/configSlice';
 import { createRouteURL } from '../router/createRouteURL';
-import { labelSelectorToQuery, ResourceClasses, useClustersVersion } from '.';
+import {
+  getResourceClass,
+  labelSelectorToQuery,
+  ResourceClasses,
+  useClustersConf,
+  useClustersVersion,
+} from '.';
+import * as clusterApi from './api/v1/clusterApi';
 import { clusterRequest } from './api/v1/clusterRequests';
 import { Cluster, LabelSelector } from './cluster';
 import { KubeObjectClass } from './KubeObject';
 import Namespace from './namespace';
+
+it('refreshes Home and Settings tags after a context save with unchanged names', async () => {
+  const { useClusterTagStorage } = await import(
+    '../../components/App/Settings/useClusterTagStorage'
+  );
+  const original: Cluster = {
+    name: 'test',
+    auth_type: '',
+    meta_data: { source: 'kubeconfig', extensions: { headlamp_info: { tags: { env: 'old' } } } },
+  };
+  const saved: Cluster = {
+    ...original,
+    meta_data: { ...original.meta_data, extensions: { headlamp_info: { tags: { env: 'new' } } } },
+  };
+  const store = configureStore({ reducer: { config: configReducer } });
+  store.dispatch(
+    setConfig({
+      clusters: { test: original },
+      isDynamicClusterEnabled: true,
+      allowKubeconfigChanges: true,
+    })
+  );
+  storeClusterTags('test', { env: 'local' });
+  const update = vi
+    .spyOn(clusterApi, 'updateClusterTags')
+    .mockResolvedValue({ clusters: { test: saved } });
+  const wrapper = ({ children }: { children: ReactNode }) =>
+    createElement(Provider, { store, children });
+  try {
+    const { result } = renderHook(
+      () => {
+        const clusters = useClustersConf();
+        const cluster = clusters?.test;
+        const storage = useClusterTagStorage('test', cluster);
+        const homeTags = useClusterTags(['test'], Object.values(clusters ?? {}));
+        return { storage, homeTags, settingsTags: loadClusterTags('test', cluster) };
+      },
+      { wrapper }
+    );
+    expect(result.current.settingsTags).toEqual({ env: 'local' });
+    await act(async () => {
+      expect(await result.current.storage.save({ env: 'new' })).toBe(true);
+    });
+    expect(result.current.settingsTags).toEqual({ env: 'new' });
+    expect(result.current.homeTags.test).toEqual({ env: 'new' });
+  } finally {
+    update.mockRestore();
+    localStorage.clear();
+  }
+});
+
+it('publishes only the saved browser target and preserves a duplicate sibling from another document', async () => {
+  const { useClusterTagStorage } = await import(
+    '../../components/App/Settings/useClusterTagStorage'
+  );
+  const stateless = await import('../../stateless/updateStatelessClusterTags');
+  const { default: store } = await import('../../redux/stores/store');
+  const previousConfig = store.getState().config;
+  const a: Cluster = {
+    name: 'a',
+    auth_type: '',
+    server: 'https://first.example',
+    meta_data: { source: 'dynamic_cluster' },
+  };
+  const firstB: Cluster = { ...a, name: 'b' };
+  const displayedB: Cluster = {
+    ...firstB,
+    server: 'https://second.example',
+    meta_data: {
+      source: 'dynamic_cluster',
+      extensions: { headlamp_info: { tags: { env: 'second' } } },
+    },
+  };
+  const savedA: Cluster = {
+    ...a,
+    meta_data: { ...a.meta_data, extensions: { headlamp_info: { tags: { env: 'saved' } } } },
+  };
+  store.dispatch(setConfig({ clusters: previousConfig.clusters, isDynamicClusterEnabled: true }));
+  store.dispatch(setStatelessConfig({ statelessClusters: { a, b: displayedB } }));
+  const update = vi
+    .spyOn(stateless, 'updateStatelessClusterTags')
+    .mockResolvedValue('first-document');
+  const configs = vi
+    .spyOn(stateless, 'readStatelessClusterTagTarget')
+    .mockResolvedValue('first-document');
+  const parse = vi
+    .spyOn(clusterApi, 'parseKubeConfig')
+    .mockResolvedValue({ clusters: [savedA, firstB] });
+  const wrapper = ({ children }: { children: ReactNode }) =>
+    createElement(Provider, { store, children });
+  try {
+    const { result } = renderHook(() => useClusterTagStorage('a', a), { wrapper });
+    await act(async () => {
+      expect(await result.current.save({ env: 'saved' })).toBe(true);
+    });
+    expect(store.getState().config.statelessClusters).toEqual({ a: savedA, b: displayedB });
+  } finally {
+    update.mockRestore();
+    configs.mockRestore();
+    parse.mockRestore();
+    act(() => {
+      store.dispatch(
+        setConfig({ ...previousConfig, oidcAutoLogin: previousConfig.oidcAutoLogin ?? undefined })
+      );
+      store.dispatch(setStatelessConfig({ statelessClusters: previousConfig.statelessClusters }));
+    });
+    localStorage.clear();
+  }
+});
+
+it('isolates delayed save failures and busy state across selection changes with the real storage hook', async () => {
+  const { useClusterTagStorage } = await import(
+    '../../components/App/Settings/useClusterTagStorage'
+  );
+  const a: Cluster = {
+    name: 'a',
+    auth_type: '',
+    meta_data: { source: 'kubeconfig', clusterID: 'file+a' },
+  };
+  const b: Cluster = {
+    name: 'b',
+    auth_type: '',
+    meta_data: { source: 'kubeconfig', clusterID: 'file+b' },
+  };
+  const store = configureStore({ reducer: { config: configReducer } });
+  store.dispatch(
+    setConfig({ clusters: { a, b }, isDynamicClusterEnabled: true, allowKubeconfigChanges: true })
+  );
+  let failA!: (error: Error) => void;
+  let finishB!: (config: { clusters: Record<string, Cluster> }) => void;
+  const update = vi
+    .spyOn(clusterApi, 'updateClusterTags')
+    .mockReturnValueOnce(new Promise((_resolve, reject) => (failA = reject)))
+    .mockReturnValueOnce(new Promise(resolve => (finishB = resolve)));
+  const wrapper = ({ children }: { children: ReactNode }) =>
+    createElement(Provider, { store, children });
+  try {
+    const { result, rerender } = renderHook(
+      ({ selected }: { selected: Cluster }) => useClusterTagStorage(selected.name, selected),
+      { wrapper, initialProps: { selected: a } }
+    );
+    let saveA!: Promise<boolean>;
+    let saveB!: Promise<boolean>;
+    act(() => {
+      saveA = result.current.save({ env: 'a' });
+    });
+    await waitFor(() => expect(update).toHaveBeenCalledTimes(1));
+    rerender({ selected: b });
+    expect(result.current.saving).toBe(false);
+    expect(result.current.error).toBe('');
+    act(() => {
+      saveB = result.current.save({ env: 'b' });
+    });
+    await act(async () => {
+      failA(new Error('A permission denied'));
+      expect(await saveA).toBe(false);
+    });
+    await waitFor(() => expect(update).toHaveBeenCalledTimes(2));
+    expect(result.current.error).toBe('');
+    expect(result.current.saving).toBe(true);
+    await act(async () => {
+      finishB({ clusters: { a, b } });
+      expect(await saveB).toBe(true);
+    });
+    expect(result.current.saving).toBe(false);
+    rerender({ selected: a });
+    expect(result.current.error).toBe('');
+    expect(result.current.saving).toBe(false);
+  } finally {
+    update.mockRestore();
+    localStorage.clear();
+  }
+});
 
 vi.mock('./api/v1/clusterRequests', async () => {
   const actual = await vi.importActual<typeof import('./api/v1/clusterRequests')>(
@@ -301,16 +486,21 @@ describe('useClustersVersion', () => {
 });
 
 const notNamespacedClasses = [
+  'CertificateSigningRequest',
   'ClusterRole',
+  'ClusterTrustBundle',
   'ClusterRoleBinding',
   'CustomResourceDefinition',
   'DeviceClass',
   'GatewayClass',
   'IngressClass',
+  'MutatingAdmissionPolicy',
+  'MutatingAdmissionPolicyBinding',
   'Namespace',
   'Node',
   'PersistentVolume',
   'PriorityClass',
+  'ResourceSlice',
   'RuntimeClass',
   'StorageClass',
   'VolumeAttributesClass',
@@ -434,5 +624,60 @@ describe('Namespace testing', () => {
       expect(makeNamespace('renamed', 'kube-system').isProtected()).toBe(true);
       expect(makeNamespace('kube-system', 'my-app').isProtected()).toBe(false);
     });
+  });
+});
+
+describe('getResourceClass', () => {
+  it('returns null for a kind that has no registered class', () => {
+    expect(getResourceClass('TotallyUnknownKind')).toBeNull();
+  });
+
+  it('returns the class unchanged when no apiVersion is given, even for a known kind', () => {
+    expect(getResourceClass('Pod')).toBe(ResourceClasses.Pod);
+  });
+
+  it('matches a core-group (bare version) apiVersion against a class declaring "v1"', () => {
+    expect(getResourceClass('Pod', 'v1')).toBe(ResourceClasses.Pod);
+  });
+
+  it('matches a grouped apiVersion against a class declaring the same group/version', () => {
+    expect(getResourceClass('Deployment', 'apps/v1')).toBe(ResourceClasses.Deployment);
+  });
+
+  it('matches when the version differs but the group matches', () => {
+    // PodDisruptionBudget is registered as policy/v1, but a CRD/older cluster
+    // reporting policy/v1beta1 is still the same group and should match.
+    expect(getResourceClass('PodDisruptionBudget', 'policy/v1beta1')).toBe(
+      ResourceClasses.PodDisruptionBudget
+    );
+  });
+
+  it('matches against any entry when the static apiVersion is an array', () => {
+    expect(getResourceClass('Gateway', 'gateway.networking.k8s.io/v1beta1')).toBe(
+      ResourceClasses.Gateway
+    );
+  });
+
+  it('returns null when the kind matches but the group does not (issue #7321)', () => {
+    // Reproduces the reported ambiguity: a CRD (e.g. Kueue's kueue.x-k8s.io/v1beta1
+    // Workload) can share a kind name with a built-in resource registered under a
+    // different group (here: PriorityClass under scheduling.k8s.io/v1). Only the
+    // group match should resolve to the built-in class.
+    expect(getResourceClass('PriorityClass', 'kueue.x-k8s.io/v1beta1')).toBeNull();
+    expect(getResourceClass('PriorityClass', 'scheduling.k8s.io/v1')).toBe(
+      ResourceClasses.PriorityClass
+    );
+  });
+
+  it('returns null for inherited Object.prototype properties instead of throwing', () => {
+    // `kind` can come straight off the wire (e.g. an ownerReference or an advanced-search
+    // result). A kind like "constructor" or "toString" is not an own property of the
+    // ResourceClasses map, but a plain `obj[kind]` lookup still finds it on the prototype
+    // chain, so it must be rejected before any apiVersion handling touches it.
+    expect(getResourceClass('constructor')).toBeNull();
+    expect(getResourceClass('toString')).toBeNull();
+    expect(() => getResourceClass('constructor', 'v1')).not.toThrow();
+    expect(getResourceClass('constructor', 'v1')).toBeNull();
+    expect(getResourceClass('hasOwnProperty', 'apps/v1')).toBeNull();
   });
 });

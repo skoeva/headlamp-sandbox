@@ -41,6 +41,7 @@ const makeStore = () => {
           'cluster-b': { name: 'cluster-b' },
         } as any,
         isDynamicClusterEnabled: true,
+        namespaceDiscoveryEnabled: false,
         allowKubeconfigChanges: false,
         defaultPodDebugImage: '',
         defaultNodeShellImage: '',
@@ -52,6 +53,7 @@ const makeStore = () => {
           sidebarSortAlphabetically: false,
           useEvict: true,
           expandLargeGraph: false,
+          tutorialTooltips: true,
         },
       },
       projects: {

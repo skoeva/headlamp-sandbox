@@ -20,12 +20,12 @@ import { cleanup, renderHook, waitFor } from '@testing-library/react';
 import React from 'react';
 import { Provider } from 'react-redux';
 import App from '../../App';
+import { request } from '../../lib/k8s/api/v1/clusterRequests';
 import { useSelectedClusters } from '../../lib/k8s/api/v1/hooks';
-import CompositePodGroup from '../../lib/k8s/compositePodGroup';
+import ClusterTrustBundle from '../../lib/k8s/clusterTrustBundle';
 import CRD from '../../lib/k8s/crd';
 import DeviceClass from '../../lib/k8s/deviceClass';
 import { useGatewayL4RouteAvailability } from '../../lib/k8s/gatewayL4RouteAvailability';
-import PodGroup from '../../lib/k8s/podGroup';
 import reducers from '../../redux/reducers/reducers';
 import { TestContext } from '../../test';
 import { DefaultSidebars, SidebarEntry } from './sidebarSlice';
@@ -38,8 +38,35 @@ import { useSidebarItems } from './useSidebarItems';
 const DontDeleteMe = App;
 
 vi.mock('../../lib/k8s/api/v1/hooks', async importOriginal => {
-  const actual = await importOriginal<typeof import('../../lib/k8s/api/v1/hooks')>();
+  type HooksModule = typeof import('../../lib/k8s/api/v1/hooks');
+  const actual = await importOriginal<HooksModule>();
   return { ...actual, useSelectedClusters: vi.fn(actual.useSelectedClusters) };
+});
+
+const { servedSchedulingVersions } = vi.hoisted(() => ({
+  servedSchedulingVersions: { current: [] as string[] },
+}));
+
+vi.mock('../../lib/k8s/api/v1/clusterRequests', async importOriginal => {
+  type ClusterRequestsModule = typeof import('../../lib/k8s/api/v1/clusterRequests');
+  const actual = await importOriginal<ClusterRequestsModule>();
+  return {
+    ...actual,
+    request: vi.fn(async (path: string, ...rest: any[]) => {
+      if (!path.startsWith('/apis/scheduling.k8s.io/')) {
+        return (actual.request as any)(path, ...rest);
+      }
+      const version = path.replace('/apis/', '');
+      if (!servedSchedulingVersions.current.includes(version)) {
+        throw new Error('404');
+      }
+      const resources = ['workloads', 'podgroups'];
+      if (version === 'scheduling.k8s.io/v1alpha3') {
+        resources.push('compositepodgroups');
+      }
+      return { resources: resources.map(name => ({ name })) };
+    }),
+  };
 });
 
 vi.mock('../../lib/k8s/gatewayL4RouteAvailability', () => ({
@@ -81,13 +108,14 @@ describe('useSidebarItems', () => {
   beforeEach(() => {
     queryClient.clear();
     vi.mocked(useSelectedClusters).mockReturnValue([]);
-    vi.spyOn(PodGroup, 'isEnabled').mockResolvedValue(false);
-    vi.spyOn(CompositePodGroup, 'isEnabled').mockResolvedValue(false);
+    servedSchedulingVersions.current = [];
     vi.spyOn(DeviceClass, 'isEnabled').mockResolvedValue(false);
+    vi.spyOn(ClusterTrustBundle, 'isEnabled').mockResolvedValue(false);
     const emptyCRDs: [CRD[], null] = [[], null];
     vi.spyOn(CRD, 'useList').mockReturnValue(
       Object.assign(emptyCRDs, {
         data: null,
+        dataUpdatedAt: 0,
         items: emptyCRDs[0],
         error: null,
         errors: null,
@@ -165,6 +193,36 @@ describe('useSidebarItems', () => {
     }
   );
 
+  describe('Cluster Trust Bundles under Security', () => {
+    const securityItems = (items: ReturnType<typeof useSidebarItems>) =>
+      items.find(item => item.name === 'security')?.subList?.map(item => item.name);
+
+    beforeEach(() => {
+      vi.mocked(useSelectedClusters).mockReturnValue(['test-cluster']);
+    });
+
+    it('is left out when the cluster does not serve trust bundles', async () => {
+      const bundlesEnabled = vi.spyOn(ClusterTrustBundle, 'isEnabled').mockResolvedValue(false);
+      const { result } = renderHook(() => useSidebarItems(), {
+        wrapper: wrapper(mockStore({}, [])),
+      });
+
+      await waitFor(() => expect(bundlesEnabled).toHaveBeenCalledWith('test-cluster'));
+      expect(securityItems(result.current)).not.toContain('clusterTrustBundles');
+      // The rest of the section is unaffected by the gate.
+      expect(securityItems(result.current)).toContain('serviceAccounts');
+    });
+
+    it('is listed once the cluster serves them', async () => {
+      vi.spyOn(ClusterTrustBundle, 'isEnabled').mockResolvedValue(true);
+      const { result } = renderHook(() => useSidebarItems(), {
+        wrapper: wrapper(mockStore({}, [])),
+      });
+
+      await waitFor(() => expect(securityItems(result.current)).toContain('clusterTrustBundles'));
+    });
+  });
+
   describe('the Scheduling (alpha) section', () => {
     const schedulingItems = (items: ReturnType<typeof useSidebarItems>) =>
       items.find(item => item.name === 'scheduling')?.subList?.map(item => item.name);
@@ -176,8 +234,7 @@ describe('useSidebarItems', () => {
     it('keeps the section but leaves out Composite Pod Groups when only its gate is off', async () => {
       // CompositePodGroup needs a feature gate on top of the ones PodGroup needs, so a
       // cluster can serve pod groups without serving it.
-      vi.spyOn(PodGroup, 'isEnabled').mockResolvedValue(true);
-      const compositeEnabled = vi.spyOn(CompositePodGroup, 'isEnabled').mockResolvedValue(false);
+      servedSchedulingVersions.current = ['scheduling.k8s.io/v1beta1'];
       const { result } = renderHook(() => useSidebarItems(), {
         wrapper: wrapper(mockStore({}, [])),
       });
@@ -185,12 +242,10 @@ describe('useSidebarItems', () => {
       await waitFor(() =>
         expect(schedulingItems(result.current)).toEqual(['podGroups', 'schedulingWorkloads'])
       );
-      expect(compositeEnabled).toHaveBeenCalledWith('test-cluster');
     });
 
     it('lists Composite Pod Groups when the cluster serves both', async () => {
-      vi.spyOn(PodGroup, 'isEnabled').mockResolvedValue(true);
-      vi.spyOn(CompositePodGroup, 'isEnabled').mockResolvedValue(true);
+      servedSchedulingVersions.current = ['scheduling.k8s.io/v1alpha3'];
       const { result } = renderHook(() => useSidebarItems(), {
         wrapper: wrapper(mockStore({}, [])),
       });
@@ -205,13 +260,16 @@ describe('useSidebarItems', () => {
     });
 
     it('hides the section when the cluster serves neither', async () => {
-      const podGroupEnabled = vi.spyOn(PodGroup, 'isEnabled').mockResolvedValue(false);
-      vi.spyOn(CompositePodGroup, 'isEnabled').mockResolvedValue(false);
+      servedSchedulingVersions.current = [];
       const { result } = renderHook(() => useSidebarItems(), {
         wrapper: wrapper(mockStore({}, [])),
       });
 
-      await waitFor(() => expect(podGroupEnabled).toHaveBeenCalledWith('test-cluster'));
+      await waitFor(() =>
+        expect(request).toHaveBeenCalledWith('/apis/scheduling.k8s.io/v1alpha2', {
+          cluster: 'test-cluster',
+        })
+      );
       expect(schedulingItems(result.current)).toBeUndefined();
     });
   });

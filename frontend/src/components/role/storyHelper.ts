@@ -43,6 +43,13 @@ export const ROLE_DUMMY_DATA: KubeRole[] = [
         nonResourceURLs: [],
         resourceNames: [],
       },
+      {
+        apiGroups: [''],
+        resources: ['configmaps'],
+        verbs: ['get'],
+        nonResourceURLs: [],
+        resourceNames: ['app-config'],
+      },
     ],
   },
 ];
@@ -63,6 +70,13 @@ export const CLUSTER_ROLE_DUMMY_DATA: KubeRole[] = [
         resources: ['nodes', 'nodes/status'],
         verbs: ['get', 'list', 'watch'],
         nonResourceURLs: [],
+        resourceNames: [],
+      },
+      {
+        apiGroups: [],
+        resources: [],
+        verbs: ['get'],
+        nonResourceURLs: ['/healthz', '/readyz'],
         resourceNames: [],
       },
     ],
@@ -91,6 +105,31 @@ export const ROLE_BINDING_DUMMY_DATA: KubeRoleBinding[] = [
         kind: 'User',
         name: 'jane',
       },
+      {
+        kind: 'ServiceAccount',
+        name: 'default',
+        namespace: 'default',
+      },
+    ],
+  },
+  {
+    // A namespaced RoleBinding that references a ClusterRole (allowed by
+    // Kubernetes); see https://github.com/kubernetes-sigs/headlamp/issues/7669
+    apiVersion: 'rbac.authorization.k8s.io/v1',
+    kind: 'RoleBinding',
+    metadata: {
+      name: 'view-binding',
+      namespace: 'default',
+      uid: 'rolebinding-view-binding-uid',
+      resourceVersion: '203',
+      creationTimestamp: '2023-04-01T10:20:00Z',
+    },
+    roleRef: {
+      apiGroup: 'rbac.authorization.k8s.io',
+      kind: 'ClusterRole',
+      name: 'view',
+    },
+    subjects: [
       {
         kind: 'ServiceAccount',
         name: 'default',

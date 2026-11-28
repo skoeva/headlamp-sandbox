@@ -144,6 +144,8 @@ func testAddRepo(t *testing.T, helmHandler *helm.Handler, repoName, repoURL stri
 }
 
 // TestAddRepositoryToHelm.
+//
+//nolint:funlen // Test covers adding repositories with various valid and invalid requests
 func TestAddRepository(t *testing.T) {
 	helmHandler := newHelmHandler(t)
 
@@ -186,6 +188,56 @@ func TestAddRepository(t *testing.T) {
 		assert.Equal(t, http.StatusBadRequest, rr.Code)
 		assert.Contains(t, rr.Body.String(), "url is required")
 	})
+
+	t.Run("name_with_path_traversal_is_rejected", func(t *testing.T) {
+		req, err := http.NewRequestWithContext(context.Background(), "POST",
+			"/clusters/minikube/helm/repositories/charts",
+			bytes.NewBufferString(`{"name":"../../../escaped","url":"https://kubernetes-sigs.github.io/headlamp/"}`))
+		require.NoError(t, err)
+
+		rr := httptest.NewRecorder()
+		helmHandler.AddRepo(rr, req)
+		assert.Equal(t, http.StatusBadRequest, rr.Code)
+		assert.Contains(t, rr.Body.String(), "path separators")
+
+		assert.False(t, checkRepoExists(t, helmHandler, "../../../escaped"))
+	})
+
+	t.Run("unsupported_scheme", func(t *testing.T) {
+		req, err := http.NewRequestWithContext(context.Background(), "POST",
+			"/clusters/minikube/helm/repositories/charts",
+			bytes.NewBufferString(`{"name":"headlamp_test_repo","url":"file:///etc/passwd"}`))
+		require.NoError(t, err)
+
+		rr := httptest.NewRecorder()
+		helmHandler.AddRepo(rr, req)
+		assert.Equal(t, http.StatusBadRequest, rr.Code)
+		assert.Contains(t, rr.Body.String(), "url scheme must be http or https")
+	})
+
+	t.Run("oci_scheme", func(t *testing.T) {
+		req, err := http.NewRequestWithContext(context.Background(), "POST",
+			"/clusters/minikube/helm/repositories/charts",
+			bytes.NewBufferString(`{"name":"headlamp_test_repo","url":"oci://registry-1.docker.io/bitnamicharts"}`))
+		require.NoError(t, err)
+
+		rr := httptest.NewRecorder()
+		helmHandler.AddRepo(rr, req)
+		assert.Equal(t, http.StatusBadRequest, rr.Code)
+		assert.Contains(t, rr.Body.String(), "OCI registries can't be added as repositories")
+	})
+
+	t.Run("malformed_url", func(t *testing.T) {
+		req, err := http.NewRequestWithContext(context.Background(), "POST",
+			"/clusters/minikube/helm/repositories/charts",
+			bytes.NewBufferString(`{"name":"headlamp_test_repo","url":"://invalid-url"}`))
+		require.NoError(t, err)
+
+		rr := httptest.NewRecorder()
+		helmHandler.AddRepo(rr, req)
+		assert.Equal(t, http.StatusBadRequest, rr.Code)
+		assert.Contains(t, rr.Body.String(), "invalid url")
+	})
 }
 
 // TestRemoveRepository.
@@ -218,6 +270,8 @@ func TestRemoveRepository(t *testing.T) {
 }
 
 // TestUpdateRepo.
+//
+//nolint:funlen // Test covers updating repositories with various valid and invalid requests
 func TestUpdateRepo(t *testing.T) {
 	helmHandler := newHelmHandler(t)
 
@@ -258,6 +312,42 @@ func TestUpdateRepo(t *testing.T) {
 		helmHandler.UpdateRepository(rr, req)
 		assert.Equal(t, http.StatusBadRequest, rr.Code)
 		assert.Contains(t, rr.Body.String(), "url is required")
+	})
+
+	t.Run("name_with_path_traversal_is_rejected", func(t *testing.T) {
+		req, err := http.NewRequestWithContext(context.Background(), "PUT",
+			"/clusters/minikube/helm/repositories",
+			bytes.NewBufferString(`{"name":"../../../escaped","url":"https://kubernetes-sigs.github.io/headlamp/"}`))
+		require.NoError(t, err)
+
+		rr := httptest.NewRecorder()
+		helmHandler.UpdateRepository(rr, req)
+		assert.Equal(t, http.StatusBadRequest, rr.Code)
+		assert.Contains(t, rr.Body.String(), "path separators")
+	})
+
+	t.Run("unsupported_scheme", func(t *testing.T) {
+		req, err := http.NewRequestWithContext(context.Background(), "PUT",
+			"/clusters/minikube/helm/repositories",
+			bytes.NewBufferString(`{"name":"headlamp_test_repo","url":"ftp://charts.example.com"}`))
+		require.NoError(t, err)
+
+		rr := httptest.NewRecorder()
+		helmHandler.UpdateRepository(rr, req)
+		assert.Equal(t, http.StatusBadRequest, rr.Code)
+		assert.Contains(t, rr.Body.String(), "url scheme must be http or https")
+	})
+
+	t.Run("oci_scheme", func(t *testing.T) {
+		req, err := http.NewRequestWithContext(context.Background(), "PUT",
+			"/clusters/minikube/helm/repositories",
+			bytes.NewBufferString(`{"name":"headlamp_test_repo","url":"oci://registry-1.docker.io/bitnamicharts"}`))
+		require.NoError(t, err)
+
+		rr := httptest.NewRecorder()
+		helmHandler.UpdateRepository(rr, req)
+		assert.Equal(t, http.StatusBadRequest, rr.Code)
+		assert.Contains(t, rr.Body.String(), "OCI registries can't be added as repositories")
 	})
 }
 
@@ -598,4 +688,234 @@ func TestCreateFileIfNotThere(t *testing.T) {
 		_, statErr := os.Stat(customSettings.RepositoryConfig)
 		assert.NoError(t, statErr, "repository config file should have been created by createFileIfNotThere")
 	})
+}
+
+// TestAddUpdateRepoRequestValidateRejectsPathSeparators covers the regression for a repository
+// name such as "../../../escaped", which DownloadIndexFile would otherwise turn into a cache
+// index file path outside the Helm repository cache directory.
+func TestAddUpdateRepoRequestValidateRejectsPathSeparators(t *testing.T) {
+	tests := []struct {
+		name      string
+		repoName  string
+		expectErr bool
+	}{
+		{name: "parent_dir_prefix", repoName: "../x", expectErr: true},
+		{name: "forward_slash", repoName: "a/b", expectErr: true},
+		{name: "backslash", repoName: `a\b`, expectErr: true},
+		{name: "dot_dot_only", repoName: "..", expectErr: true},
+		{name: "dot_only_is_allowed", repoName: ".", expectErr: false},
+		{name: "leading_trailing_spaces_allowed", repoName: "  bitnami  ", expectErr: false},
+		{name: "normal_name_allowed", repoName: "bitnami", expectErr: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := helm.AddUpdateRepoRequest{
+				Name: tt.repoName,
+				URL:  "https://kubernetes-sigs.github.io/headlamp/",
+			}
+
+			err := req.Validate()
+
+			if tt.expectErr {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), "path separators")
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+//nolint:funlen // Table-driven validation tests for AddUpdateRepoRequest
+func TestAddUpdateRepoRequest_Validate(t *testing.T) {
+	tests := []struct {
+		name        string
+		req         helm.AddUpdateRepoRequest
+		expectedErr string
+	}{
+		{
+			name: "valid_https",
+			req: helm.AddUpdateRepoRequest{
+				Name: "bitnami",
+				URL:  "https://charts.bitnami.com/bitnami",
+			},
+		},
+		{
+			name: "valid_http",
+			req: helm.AddUpdateRepoRequest{
+				Name: "local",
+				URL:  "http://localhost:8080/charts",
+			},
+		},
+		{
+			name: "unsupported_scheme_oci",
+			req: helm.AddUpdateRepoRequest{
+				Name: "oci_repo",
+				URL:  "oci://registry-1.docker.io/bitnamicharts",
+			},
+			expectedErr: "OCI registries can't be added as repositories",
+		},
+		{
+			name: "missing_name",
+			req: helm.AddUpdateRepoRequest{
+				Name: "  ",
+				URL:  "https://charts.bitnami.com/bitnami",
+			},
+			expectedErr: "name is required",
+		},
+		{
+			name: "missing_url",
+			req: helm.AddUpdateRepoRequest{
+				Name: "repo",
+				URL:  "   ",
+			},
+			expectedErr: "url is required",
+		},
+		{
+			name: "unsupported_scheme_file",
+			req: helm.AddUpdateRepoRequest{
+				Name: "repo",
+				URL:  "file:///etc/passwd",
+			},
+			expectedErr: "url scheme must be http or https",
+		},
+		{
+			name: "unsupported_scheme_ftp",
+			req: helm.AddUpdateRepoRequest{
+				Name: "repo",
+				URL:  "ftp://example.com/charts",
+			},
+			expectedErr: "url scheme must be http or https",
+		},
+		{
+			name: "missing_scheme",
+			req: helm.AddUpdateRepoRequest{
+				Name: "repo",
+				URL:  "charts.example.com/repo",
+			},
+			expectedErr: "invalid url",
+		},
+		{
+			name: "missing_host",
+			req: helm.AddUpdateRepoRequest{
+				Name: "repo",
+				URL:  "https:///charts",
+			},
+			expectedErr: "url host is required",
+		},
+		{
+			name: "missing_host_port_only",
+			req: helm.AddUpdateRepoRequest{
+				Name: "repo",
+				URL:  "https://:443/charts",
+			},
+			expectedErr: "url host is required",
+		},
+		{
+			name: "url_with_leading_whitespace",
+			req: helm.AddUpdateRepoRequest{
+				Name: "repo",
+				URL:  " https://example.com/charts",
+			},
+			expectedErr: "invalid url",
+		},
+		{
+			name: "malformed_url_embedded_credentials",
+			req: helm.AddUpdateRepoRequest{
+				Name: "repo",
+				URL:  "https://alice:" + "testcred" + "@charts.example.com/%zz",
+			},
+			expectedErr: "invalid url",
+		},
+		{
+			name: "malformed_url_embedded_credentials_extra_slash",
+			req: helm.AddUpdateRepoRequest{
+				Name: "repo",
+				URL:  "https://alice:" + "testcred" + "/extra@charts.example.com/charts",
+			},
+			expectedErr: "invalid url",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.req.Validate()
+			if tt.expectedErr == "" {
+				assert.NoError(t, err)
+			} else {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.expectedErr)
+				assert.NotContains(t, err.Error(), "testcred")
+				assert.NotContains(t, err.Error(), "alice")
+			}
+		})
+	}
+}
+
+func TestRepoHandlers_AddListRemoveErrors(t *testing.T) {
+	t.Run("add_repo_internal_error", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusNotFound)
+		}))
+		defer srv.Close()
+
+		h := newIsolatedHelmHandler(t)
+		req, err := http.NewRequestWithContext(context.Background(), http.MethodPost,
+			"/clusters/minikube/helm/repositories/charts",
+			mustJSONBody(t, helm.AddUpdateRepoRequest{Name: "bad", URL: srv.URL}))
+		require.NoError(t, err)
+
+		rr := httptest.NewRecorder()
+		h.AddRepo(rr, req)
+		assert.Equal(t, http.StatusInternalServerError, rr.Code)
+	})
+
+	t.Run("list_repo_internal_error", func(t *testing.T) {
+		h := newIsolatedHelmHandler(t)
+		require.NoError(t, os.WriteFile(h.RepositoryConfig, []byte(":::invalid-yaml"), 0o600))
+
+		req, err := http.NewRequestWithContext(context.Background(), http.MethodGet,
+			"/clusters/minikube/helm/repositories", nil)
+		require.NoError(t, err)
+
+		rr := httptest.NewRecorder()
+		h.ListRepo(rr, req)
+		assert.Equal(t, http.StatusInternalServerError, rr.Code)
+	})
+
+	t.Run("remove_repo_internal_error", func(t *testing.T) {
+		h := newIsolatedHelmHandler(t)
+		require.NoError(t, os.WriteFile(h.RepositoryConfig, []byte(":::invalid-yaml"), 0o600))
+
+		req, err := http.NewRequestWithContext(context.Background(), http.MethodDelete,
+			"/clusters/minikube/helm/repositories/?name=myrepo", nil)
+		require.NoError(t, err)
+
+		rr := httptest.NewRecorder()
+		h.RemoveRepo(rr, req)
+		assert.Equal(t, http.StatusInternalServerError, rr.Code)
+	})
+}
+
+func TestRepoHandlers_UpdateErrors(t *testing.T) {
+	h := newIsolatedHelmHandler(t)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPut,
+		"/clusters/minikube/helm/repositories",
+		mustJSONBody(t, helm.AddUpdateRepoRequest{Name: "missing", URL: "https://example.test/charts"}))
+	require.NoError(t, err)
+
+	rr := httptest.NewRecorder()
+	h.UpdateRepository(rr, req)
+	assert.Equal(t, http.StatusNotFound, rr.Code)
+
+	require.NoError(t, os.WriteFile(h.RepositoryConfig, []byte(":::invalid-yaml"), 0o600))
+	req2, err := http.NewRequestWithContext(context.Background(), http.MethodPut,
+		"/clusters/minikube/helm/repositories",
+		mustJSONBody(t, helm.AddUpdateRepoRequest{Name: "missing", URL: "https://example.test/charts"}))
+	require.NoError(t, err)
+
+	rr2 := httptest.NewRecorder()
+	h.UpdateRepository(rr2, req2)
+	assert.Equal(t, http.StatusInternalServerError, rr2.Code)
 }

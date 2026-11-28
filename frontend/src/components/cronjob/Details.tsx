@@ -45,7 +45,7 @@ import { getLastScheduleTime, getSchedule } from './List';
 // method to generate a unique string
 const uniqueString = () => {
   const timestamp = Date.now().toString(36);
-  const randomNum = Math.random().toString(36).substr(2, 5);
+  const randomNum = Math.random().toString(36).slice(2, 7);
   return `${timestamp}-${randomNum}`;
 };
 
@@ -145,6 +145,14 @@ function SpawnJobDialog(props: { cronJob: CronJob; cluster?: string; onClose: ()
           inputProps={{ 'aria-describedby': showJobNameError ? 'name-helper-text' : undefined }}
           onChange={e => {
             setJobName(e.target.value);
+          }}
+          onKeyDown={e => {
+            if (e.key === 'Enter') {
+              e.preventDefault();
+              if (isValidJobName) {
+                handleSpawn();
+              }
+            }
           }}
         />
         {showJobNameError && (

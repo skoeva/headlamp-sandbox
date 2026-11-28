@@ -966,12 +966,16 @@ export class PluginManager {
    * @param {string} name - The name of the plugin to uninstall.
    * @param {string} [folder=defaultUserPluginsDir()] - The folder where the plugin is installed.
    * @param {function} [progressCallback=null] - Optional callback for progress updates.
+   * @param {function} [beforeRemove] - Optional cleanup that runs with the bundle's folder name
+   * before the bundle is deleted. If it throws, the bundle is kept and the uninstall fails, so a
+   * retry can find the bundle and run the cleanup again.
    * @returns {void}
    */
   static uninstall(
     name: string,
     folder = defaultUserPluginsDir(),
-    progressCallback: null | ProgressCallback = null
+    progressCallback: null | ProgressCallback = null,
+    beforeRemove?: (folderName: string) => void
   ) {
     try {
       // @todo: should list call take progressCallback?
@@ -990,6 +994,7 @@ export class PluginManager {
       }
 
       if (fs.existsSync(pluginDir)) {
+        beforeRemove?.(plugin.folderName);
         fs.rmSync(pluginDir, { recursive: true, force: true });
         removePluginInstallationReceipt(pluginDir);
       } else {
@@ -1089,6 +1094,19 @@ export class PluginManager {
 function validatePluginName(pluginName: string): boolean {
   const invalidPattern = /[\/\\]|(\.\.)/;
   return !invalidPattern.test(pluginName);
+}
+
+export function normalizeChecksum(checksum: string): string {
+  const normalized = checksum
+    .trim()
+    .replace(/^sha256:/i, '')
+    .toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(normalized)) {
+    throw new Error(
+      'Invalid checksum. Expected a SHA-256 hex digest like "sha256:<64 hex chars>".'
+    );
+  }
+  return normalized;
 }
 
 /**
@@ -1379,11 +1397,7 @@ async function downloadAndExtractSingleArchive(
     throw new Error('Invalid plugin metadata. Please check the plugin details.');
   }
 
-  let checksum = archiveChecksum;
-  if (checksum.startsWith('sha256:') || checksum.startsWith('SHA256:')) {
-    checksum = checksum.replace('sha256:', '');
-    checksum = checksum.replace('SHA256:', '');
-  }
+  const checksum = normalizeChecksum(archiveChecksum);
 
   if (signal && signal.aborted) {
     throw new Error('Download cancelled');
@@ -1522,26 +1536,37 @@ async function downloadAndExtractSingleArchive(
   }
 }
 
+const DANGEROUS_ANNOTATION_SEGMENTS = new Set(['__proto__', 'constructor', 'prototype']);
+
 /**
  * Converts annotations input into a nested JavaScript object structure.
  * @param annotations - A record of annotations with path-style keys.
  * @returns A nested JavaScript object structure.
  */
 function convertAnnotations(annotations: Record<string, string>): Record<string, any> {
-  const result: Record<string, any> = {};
+  const result: Record<string, any> = Object.create(null);
 
-  for (const key in annotations) {
-    const value = annotations[key];
+  if (!annotations || typeof annotations !== 'object') {
+    return result;
+  }
+
+  for (const [key, value] of Object.entries(annotations)) {
     const parts = key.split('/');
-    let current = result;
+    if (parts.some(part => DANGEROUS_ANNOTATION_SEGMENTS.has(part))) {
+      continue;
+    }
 
+    let current = result;
     for (let i = 0; i < parts.length; i++) {
       const part = parts[i];
       if (i === parts.length - 1) {
         current[part] = value;
       } else {
-        if (!current[part]) {
-          current[part] = {};
+        const next = Object.prototype.hasOwnProperty.call(current, part)
+          ? current[part]
+          : undefined;
+        if (!next || typeof next !== 'object') {
+          current[part] = Object.create(null);
         }
         current = current[part];
       }
@@ -1759,6 +1784,42 @@ export function defaultKubeConfigsDir(): string {
   const paths = envPaths(appConfigDirName, { suffix: '' });
   const configDir = process.platform === 'darwin' ? paths.data : paths.config;
   return path.join(configDir, 'kubeconfigs');
+}
+
+/**
+ * Reports whether targetPath resolves to a location strictly inside baseDir.
+ *
+ * Used to validate renderer-supplied path segments (e.g. a plugin folder
+ * name) before they're used in filesystem operations, so a value like
+ * "../../../../etc" can't escape the intended directory.
+ *
+ * @param baseDir - The directory targetPath is expected to stay within.
+ * @param targetPath - The resolved path to check.
+ * @returns {boolean} True if targetPath is a strict subpath of baseDir.
+ */
+export function isPathWithinDirectory(baseDir: string, targetPath: string): boolean {
+  const relative = path.relative(baseDir, targetPath);
+  return (
+    relative !== '' &&
+    relative !== '..' &&
+    !relative.startsWith(`..${path.sep}`) &&
+    !path.isAbsolute(relative)
+  );
+}
+
+/**
+ * Reports whether targetPath is an existing directory.
+ * Used by the open-plugin-folder handler to ensure a renderer-supplied path
+ * names an actual directory before revealing it with shell.showItemInFolder.
+ * @param targetPath - The path to check.
+ * @returns {boolean} True if targetPath exists and is a directory.
+ */
+export function isExistingDirectory(targetPath: string): boolean {
+  try {
+    return fs.statSync(targetPath).isDirectory();
+  } catch {
+    return false;
+  }
 }
 
 /**

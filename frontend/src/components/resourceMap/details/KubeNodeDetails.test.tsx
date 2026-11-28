@@ -28,6 +28,15 @@ vi.mock('../../../lib/k8s/deployment', () => ({ default: class Deployment {} }))
 vi.mock('../../../lib/k8s/jobSet', () => ({ default: class JobSet {} }));
 vi.mock('../../../lib/k8s/leaderWorkerSet', () => ({ default: class LeaderWorkerSet {} }));
 vi.mock('../../../lib/k8s/replicaSet', () => ({ default: class ReplicaSet {} }));
+vi.mock('../../certificatesigningrequest/Details', () => ({
+  default: makeDetails('CertificateSigningRequest'),
+}));
+vi.mock('../../compositePodGroup/Details', () => ({
+  default: makeDetails('CompositePodGroup'),
+}));
+vi.mock('../../clustertrustbundle/Details', () => ({
+  default: makeDetails('ClusterTrustBundle'),
+}));
 vi.mock('../../configmap/Details', () => ({ default: makeDetails('ConfigMap') }));
 vi.mock('../../crd/CustomResourceDetails', () => ({
   CustomResourceDetails: ({ crName, crd, namespace, cluster }: any) =>
@@ -58,6 +67,12 @@ vi.mock('../../ingress/Details', () => ({ default: makeDetails('Ingress') }));
 vi.mock('../../job/Details', () => ({ default: makeDetails('Job') }));
 vi.mock('../../lease/Details', () => ({ LeaseDetails: makeDetails('Lease') }));
 vi.mock('../../limitRange/Details', () => ({ LimitRangeDetails: makeDetails('LimitRange') }));
+vi.mock('../../mutatingAdmissionPolicy/Details', () => ({
+  default: makeDetails('MutatingAdmissionPolicy'),
+}));
+vi.mock('../../mutatingAdmissionPolicyBinding/Details', () => ({
+  default: makeDetails('MutatingAdmissionPolicyBinding'),
+}));
 vi.mock('../../namespace/Details', () => ({ default: makeDetails('Namespace') }));
 vi.mock('../../networkpolicy/Details', () => ({
   NetworkPolicyDetails: makeDetails('NetworkPolicy'),
@@ -67,17 +82,24 @@ vi.mock('../../pod/Details', () => ({ default: makeDetails('Pod') }));
 vi.mock('../../podDisruptionBudget/Details', () => ({
   default: makeDetails('PodDisruptionBudget'),
 }));
+vi.mock('../../podGroup/Details', () => ({ default: makeDetails('PodGroup') }));
 vi.mock('../../priorityClass/Details', () => ({ default: makeDetails('PriorityClass') }));
 vi.mock('../../device/DeviceClassDetails', () => ({ default: makeDetails('DeviceClass') }));
 vi.mock('../../device/ResourceClaimDetails', () => ({ default: makeDetails('ResourceClaim') }));
 vi.mock('../../device/ResourceClaimTemplateDetails', () => ({
   default: makeDetails('ResourceClaimTemplate'),
 }));
+vi.mock('../../device/ResourceSliceDetails', () => ({
+  default: makeDetails('ResourceSlice'),
+}));
 vi.mock('../../resourceQuota/Details', () => ({ default: makeDetails('ResourceQuota') }));
 vi.mock('../../role/BindingDetails', () => ({ default: makeDetails('RoleBinding') }));
 vi.mock('../../role/Details', () => ({ default: makeDetails('Role') }));
 vi.mock('../../runtimeClass/Details', () => ({
   RuntimeClassDetails: makeDetails('RuntimeClass'),
+}));
+vi.mock('../../schedulingWorkload/Details', () => ({
+  default: makeDetails('SchedulingWorkload'),
 }));
 vi.mock('../../secret/Details', () => ({ default: makeDetails('Secret') }));
 vi.mock('../../service/Details', () => ({ default: makeDetails('Service') }));
@@ -125,8 +147,11 @@ const dispatchCases = [
   ['DeviceClass', 'DeviceClass'],
   ['ResourceClaim', 'ResourceClaim'],
   ['ResourceClaimTemplate', 'ResourceClaimTemplate'],
+  ['ResourceSlice', 'ResourceSlice'],
   ['ResourceQuota', 'ResourceQuota'],
   ['ClusterRole', 'Role'],
+  ['ClusterRoleBinding', 'RoleBinding'],
+  ['ClusterTrustBundle', 'ClusterTrustBundle'],
   ['Role', 'Role'],
   ['RoleBinding', 'RoleBinding'],
   ['RuntimeClass', 'RuntimeClass'],
@@ -138,8 +163,11 @@ const dispatchCases = [
   ['VolumeAttributesClass', 'VolumeAttributesClass'],
   ['PersistentVolume', 'PersistentVolume'],
   ['VerticalPodAutoscaler', 'VerticalPodAutoscaler'],
+  ['MutatingAdmissionPolicy', 'MutatingAdmissionPolicy'],
+  ['MutatingAdmissionPolicyBinding', 'MutatingAdmissionPolicyBinding'],
   ['MutatingWebhookConfiguration', 'MutatingWebhookConfiguration'],
   ['ValidatingWebhookConfiguration', 'ValidatingWebhookConfiguration'],
+  ['CertificateSigningRequest', 'CertificateSigningRequest'],
   ['IngressClass', 'IngressClass'],
   ['CustomResourceDefinition', 'CustomResourceDefinition'],
   ['crd', 'CustomResourceDefinition'],
@@ -152,6 +180,9 @@ const dispatchCases = [
   ['ReferenceGrant', 'ReferenceGrant'],
   ['BackendTLSPolicy', 'BackendTLSPolicy'],
   ['XBackendTrafficPolicy', 'BackendTLSPolicy'],
+  ['Workload', 'SchedulingWorkload'],
+  ['CompositePodGroup', 'CompositePodGroup'],
+  ['PodGroup', 'PodGroup'],
 ] as const;
 
 describe('canRenderDetails', () => {
@@ -219,6 +250,25 @@ describe('KubeObjectDetails', () => {
     expect(consoleErrorSpy).toHaveBeenCalledWith(
       'No details component for kind Widget was found. See KubeNodeDetails.tsx for more info'
     );
+  });
+
+  it('uses custom resource details for a custom resource named like a scheduling kind', () => {
+    render(
+      <KubeObjectDetails
+        resource={{
+          kind: 'PodGroup',
+          cluster: 'cluster-a',
+          metadata: { name: 'volcano-group', namespace: 'default' },
+        }}
+        customResourceDefinition="podgroups.scheduling.volcano.sh"
+      />
+    );
+
+    expect(
+      screen.getByText(
+        'CustomResource:volcano-group:podgroups.scheduling.volcano.sh:default:cluster-a'
+      )
+    ).toBeInTheDocument();
   });
 
   it('passes a missing namespace through to custom resource details', () => {

@@ -177,7 +177,12 @@ function isFieldValid(field: FormField, value: any, resource: Record<string, any
         value.length > 0 &&
         value.every(
           (p: any) =>
-            p && typeof p === 'object' && Number.isInteger(p.port) && p.port >= 1 && p.port <= 65535
+            p &&
+            typeof p === 'object' &&
+            Number.isInteger(p.port) &&
+            p.port >= 1 &&
+            p.port <= 65535 &&
+            isValidTargetPort(p.targetPort)
         )
       );
     case 'boolean':
@@ -631,6 +636,14 @@ export interface ServicePortsTextFieldProps {
   showNodePort?: boolean;
 }
 
+/** A Service targetPort is optional and can be a port name, but a number has to be 1-65535. */
+function isValidTargetPort(targetPort: unknown): boolean {
+  return (
+    typeof targetPort !== 'number' ||
+    (Number.isInteger(targetPort) && targetPort >= 1 && targetPort <= 65535)
+  );
+}
+
 /** Editor for a Service's `spec.ports` array. Renders one row per port with
  *  name / port / targetPort / nodePort / protocol inputs plus add/remove
  *  controls. `targetPort` accepts either an integer or a string (named
@@ -726,6 +739,12 @@ export function ServicePortsTextField(props: ServicePortsTextFieldProps) {
             label={t('translation|Target Port')}
             value={port?.targetPort ?? ''}
             onChange={event => updatePort(index, 'targetPort', event.target.value)}
+            error={!isValidTargetPort(port?.targetPort)}
+            helperText={
+              isValidTargetPort(port?.targetPort)
+                ? undefined
+                : t('translation|Please enter a valid port number (1-65535).')
+            }
           />
           {showNodePort && (
             <FormTextField
@@ -774,10 +793,28 @@ export interface LabelTextFieldProps {
   required?: boolean;
   /** Optional helper text shown via an info-icon tooltip next to the label. */
   helperText?: string;
+  /**
+   * Called with the editor rows whenever they change. Unlike `onChange`, rows with an
+   * empty or duplicate key are included, so callers can validate them.
+   */
+  onRowsChange?: (rows: LabelRow[]) => void;
+  /** Use Headlamp tag terminology instead of Kubernetes label terminology. */
+  terminology?: 'label' | 'tag';
+  /** Disable all editing controls. */
+  disabled?: boolean;
 }
 
 export function LabelTextField(props: LabelTextFieldProps) {
-  const { value, onChange, label, required, helperText } = props;
+  const {
+    value,
+    onChange,
+    label,
+    required,
+    helperText,
+    onRowsChange,
+    terminology = 'label',
+    disabled = false,
+  } = props;
   const { t } = useTranslation(['translation']);
   const groupLabelId = useId('label-group-');
 
@@ -795,7 +832,14 @@ export function LabelTextField(props: LabelTextFieldProps) {
     }
   }, [value]);
 
+  React.useEffect(() => {
+    onRowsChange?.(rows);
+  }, [rows, onRowsChange]);
+
   function commit(next: LabelRow[]) {
+    if (disabled) {
+      return;
+    }
     setRows(next);
     const map = labelRowsToMap(next);
     lastEmittedRef.current = map;
@@ -804,11 +848,12 @@ export function LabelTextField(props: LabelTextFieldProps) {
 
   function addLabel() {
     const used = new Set(rows.map(r => r.key));
-    let nextKey = 'new-label';
+    const keyPrefix = terminology === 'tag' ? 'new-tag' : 'new-label';
+    let nextKey = keyPrefix;
     let idx = 1;
     while (used.has(nextKey)) {
       idx += 1;
-      nextKey = `new-label-${idx}`;
+      nextKey = `${keyPrefix}-${idx}`;
     }
     commit([...rows, { id: nextLabelRowId(), key: nextKey, value: '' }]);
   }
@@ -838,24 +883,35 @@ export function LabelTextField(props: LabelTextFieldProps) {
       {rows.map(r => (
         <Box key={r.id} sx={{ display: 'flex', gap: 1, alignItems: 'center', mt: 2, mb: 2 }}>
           <FormTextField
+            disabled={disabled}
             label={t('translation|Key')}
             value={r.key}
             onChange={e => handleKeyEdit(r.id, e.target.value)}
-            inputProps={{ 'aria-label': t('translation|Label key') }}
+            inputProps={{
+              'aria-label':
+                terminology === 'tag' ? t('translation|Tag key') : t('translation|Label key'),
+            }}
           />
           <FormTextField
+            disabled={disabled}
             label={t('translation|Value')}
             value={r.value}
             onChange={e => handleValueEdit(r.id, e.target.value)}
-            inputProps={{ 'aria-label': t('translation|Label value') }}
+            inputProps={{
+              'aria-label':
+                terminology === 'tag' ? t('translation|Tag value') : t('translation|Label value'),
+            }}
           />
           <IconButton
+            disabled={disabled}
             onClick={() => handleDelete(r.id)}
             color="default"
             size="small"
-            aria-label={t('translation|Remove label {{ label }}', {
-              label: `${r.key}=${r.value}`,
-            })}
+            aria-label={
+              terminology === 'tag'
+                ? t('translation|Remove tag {{ tag }}', { tag: `${r.key}=${r.value}` })
+                : t('translation|Remove label {{ label }}', { label: `${r.key}=${r.value}` })
+            }
           >
             <Icon icon="mdi:close-circle" width={24} height={24} />
           </IconButton>
@@ -863,14 +919,15 @@ export function LabelTextField(props: LabelTextFieldProps) {
       ))}
       <Box sx={{ mt: 2 }}>
         <Button
+          disabled={disabled}
           onClick={addLabel}
           color="primary"
           size="small"
-          aria-label={t('translation|Add label')}
+          aria-label={terminology === 'tag' ? t('translation|Add tag') : t('translation|Add label')}
         >
           <Icon icon="mdi:plus-circle" width={24} height={24} />
           <Typography variant="body2" sx={{ ml: 0.5 }}>
-            {t('translation|New Label')}
+            {terminology === 'tag' ? t('translation|New Tag') : t('translation|New Label')}
           </Typography>
         </Button>
       </Box>
